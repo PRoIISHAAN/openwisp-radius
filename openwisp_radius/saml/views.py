@@ -9,6 +9,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model, logout
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied, ValidationError
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views.generic import UpdateView
@@ -18,7 +19,8 @@ from djangosaml2.views import (
 )
 from djangosaml2.views import LoginView as BaseLoginView
 from djangosaml2.views import LogoutInitView, LogoutView, MetadataView  # noqa
-from rest_framework.authtoken.models import Token
+
+from openwisp_users.auth import create_auth_token, record_password_based_login
 
 from .. import settings as app_settings
 from ..api.views import RadiusTokenMixin
@@ -60,6 +62,7 @@ class AssertionConsumerServiceView(
 ):
     def post_login_hook(self, request, user, session_info):
         """If desired, a hook to add logic after a user has successfully logged in."""
+        record_password_based_login(request, False)
         # In some cases, it possible that the organization cache for
         # the user is not updated before execution of the following
         # code. Hence, the cache is manually updated here.
@@ -67,31 +70,73 @@ class AssertionConsumerServiceView(
         org = self.get_organization_from_relay_state()
         is_member = user.is_member(org)
         # add user to organization
-        if not is_member:
-            orgUser = OrganizationUser(organization=org, user=user)
-            orgUser.full_clean()
-            orgUser.save()
-        try:
-            user.registered_user
-        except ObjectDoesNotExist:
-            registered_user = RegisteredUser(
-                user=user, method="saml", is_verified=app_settings.SAML_IS_VERIFIED
+        with transaction.atomic():
+            if not is_member:
+                orgUser = OrganizationUser(organization=org, user=user)
+                orgUser.full_clean()
+                orgUser.save()
+            registered_user, created = RegisteredUser.get_or_create_for_user_and_org(
+                user=user,
+                organization=org,
+                defaults={
+                    "method": "saml",
+                    "is_verified": app_settings.SAML_IS_VERIFIED,
+                },
             )
-            registered_user.full_clean()
-            registered_user.save()
-            # The user is just created, it will not have an email address
-            if user.email:
+            if (
+                not created
+                and registered_user.method == "pending_verification"
+                and not registered_user.is_verified
+            ):
+                registered_user.method = "saml"
+                registered_user.is_verified = app_settings.SAML_IS_VERIFIED
+                registered_user.full_clean()
+                registered_user.save()
+        if user.email:
+            email_lowercase = user.email.lower()
+            try:
+                user_has_primary_email = EmailAddress.objects.filter(
+                    user=user, primary=True
+                )
                 try:
+                    email_address = EmailAddress.objects.get(
+                        user=user, email__iexact=email_lowercase
+                    )
+                except EmailAddress.DoesNotExist:
                     email_address = EmailAddress(
-                        user=user, email=user.email, primary=True, verified=True
+                        user=user,
+                        email=email_lowercase,
+                        verified=True,
+                        primary=not user_has_primary_email.exists(),
                     )
                     email_address.full_clean()
                     email_address.save()
-                except ValidationError:
-                    logger.exception(
-                        f'Failed email validation for "{user}"'
-                        " during SAML user creation"
-                    )
+                else:
+                    changed_fields = []
+                    if email_address.email != email_lowercase:
+                        email_address.email = email_lowercase
+                        changed_fields.append("email")
+                    if not email_address.verified:
+                        email_address.verified = True
+                        changed_fields.append("verified")
+                    if (
+                        not email_address.primary
+                        and not user_has_primary_email.exists()
+                    ):
+                        email_address.primary = True
+                        changed_fields.append("primary")
+                    if changed_fields:
+                        email_address.full_clean()
+                        email_address.save(update_fields=changed_fields)
+            except (
+                ValidationError,
+                IntegrityError,
+                EmailAddress.MultipleObjectsReturned,
+            ):
+                logger.exception(
+                    f'Failed email synchronization for "{user}" during'
+                    " SAML user creation"
+                )
 
     def customize_relay_state(self, relay_state):
         """
@@ -106,8 +151,7 @@ class AssertionConsumerServiceView(
         For example, some sites may require user registration if the user has not
         yet been provisioned.
         """
-        Token.objects.filter(user=user).delete()
-        token, _ = Token.objects.get_or_create(user=user)
+        token = create_auth_token(self.request, user, renew=True)
         next = "{relay_state}?{params}".format(
             relay_state=relay_state,
             params=urlencode(

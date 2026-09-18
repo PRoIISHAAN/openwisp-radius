@@ -17,6 +17,14 @@ ALLOWED_HOSTS = []
 OPENWISP_RADIUS_FREERADIUS_ALLOWED_HOSTS = ["127.0.0.1"]
 OPENWISP_RADIUS_COA_ENABLED = True
 OPENWISP_RADIUS_ALLOWED_MOBILE_PREFIXES = ["+44", "+39", "+237", "+595"]
+TIMESERIES_DATABASE = {
+    "BACKEND": "openwisp_monitoring.db.backends.influxdb",
+    "USER": "openwisp",
+    "PASSWORD": "openwisp",
+    "NAME": "openwisp2",
+    "HOST": os.getenv("INFLUXDB_HOST", "localhost"),
+    "PORT": "8086",
+}
 
 INSTALLED_APPS = [
     "daphne",
@@ -233,7 +241,7 @@ OPENWISP_RADIUS_PASSWORD_RESET_URLS = {
 }
 
 if not TESTING:
-    CELERY_BROKER_URL = os.getenv("REDIS_URL", f"redis://{redis_host}/1")
+    CELERY_BROKER_URL = os.getenv("REDIS_URL", f"redis://{redis_host}/2")
 else:
     OPENWISP_RADIUS_GROUPCHECK_ADMIN = True
     OPENWISP_RADIUS_GROUPREPLY_ADMIN = True
@@ -245,11 +253,17 @@ else:
 
 TEST_RUNNER = "openwisp_utils.tests.TimeLoggingTestRunner"
 
+CELERY_TIMEZONE = TIME_ZONE
 CELERY_BEAT_SCHEDULE = {
     "deactivate_expired_users": {
-        "task": "openwisp_radius.tasks.cleanup_stale_radacct",
-        "schedule": crontab(hour=0, minute=0),
+        "task": "openwisp_users.tasks.deactivate_expired_users",
+        "schedule": crontab(hour=0, minute=1),
         "args": None,
+        "relative": True,
+    },
+    "expiration_reminder_email": {
+        "task": "openwisp_users.tasks.expiration_reminder_email",
+        "schedule": crontab(hour=0, minute=1),
         "relative": True,
     },
     "delete_old_radiusbatch_users": {
@@ -293,7 +307,9 @@ OPENWISP_RADIUS_EXTRA_NAS_TYPES = (("cisco", "Cisco Router"),)
 
 REST_AUTH = {
     "SESSION_LOGIN": False,
-    "PASSWORD_RESET_SERIALIZER": "openwisp_radius.api.serializers.PasswordResetSerializer",
+    "PASSWORD_RESET_SERIALIZER": (
+        "openwisp_users.api.serializers.PasswordResetSerializer"
+    ),
     "REGISTER_SERIALIZER": "openwisp_radius.api.serializers.RegisterSerializer",
 }
 
@@ -331,7 +347,7 @@ if TESTING:
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
             "CONFIG": {
-                "hosts": [("localhost", 6379)],
+                "hosts": [f"redis://{redis_host}/3"],
             },
         }
     }
@@ -339,13 +355,13 @@ else:
     CHANNEL_LAYERS = {
         "default": {
             "BACKEND": "channels_redis.core.RedisChannelLayer",
-            "CONFIG": {"hosts": [f"redis://{redis_host}/7"]},
+            "CONFIG": {"hosts": [f"redis://{redis_host}/3"]},
         }
     }
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": "redis://127.0.0.1:6379/6",
+            "LOCATION": f"redis://{redis_host}/0",
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
             },
@@ -386,14 +402,6 @@ if os.environ.get("MONITORING_INTEGRATION", False):
         + INSTALLED_APPS[dj_rest_auth_index:]
     )
 
-    TIMESERIES_DATABASE = {
-        "BACKEND": "openwisp_monitoring.db.backends.influxdb",
-        "USER": "openwisp",
-        "PASSWORD": "openwisp",
-        "NAME": "openwisp2",
-        "HOST": os.getenv("INFLUXDB_HOST", "localhost"),
-        "PORT": "8086",
-    }
     EXTENDED_APPS = ["django_x509", "django_loci"]
 
     DATABASES["default"]["ENGINE"] = "openwisp_utils.db.backends.spatialite"

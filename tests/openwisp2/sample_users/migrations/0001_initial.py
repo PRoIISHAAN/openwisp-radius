@@ -35,6 +35,35 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 (
+                    "password_based_token",
+                    models.BooleanField(
+                        blank=True,
+                        default=None,
+                        help_text=(
+                            "Indicates whether the last authentication token was"
+                            " obtained using the local password. When false, the"
+                            " token came from an external method (eg: SSO, SAML)"
+                            " and password expiration is not enforced for it. None"
+                            " means no token has been issued for this user since"
+                            " this feature was introduced."
+                        ),
+                        null=True,
+                        verbose_name="password based token",
+                    ),
+                ),
+                (
+                    "expiration_date",
+                    models.DateField(
+                        blank=True,
+                        help_text=(
+                            "If set, the account will be deactivated after this date"
+                            " passes and the user will no longer be able to log in."
+                        ),
+                        null=True,
+                        verbose_name="expiration date",
+                    ),
+                ),
+                (
                     "is_superuser",
                     models.BooleanField(
                         default=False,
@@ -218,7 +247,11 @@ class Migration(migrations.Migration):
                     models.Index(
                         fields=["id", "email"],
                         name="user_id_email_idx",
-                    )
+                    ),
+                    models.Index(
+                        fields=["is_active", "expiration_date"],
+                        name="user_active_expiry_idx",
+                    ),
                 ],
             },
             managers=[
@@ -314,7 +347,12 @@ class Migration(migrations.Migration):
                         default=django.utils.timezone.now, editable=False
                     ),
                 ),
-                ("is_admin", models.BooleanField(default=False)),
+                (
+                    "is_admin",
+                    models.BooleanField(
+                        default=False, verbose_name="Organization manager"
+                    ),
+                ),
                 (
                     "id",
                     models.UUIDField(

@@ -15,21 +15,34 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.sites.models import Site
 from django.core import mail
 from django.core.cache import cache
 from django.core.mail import EmailMultiAlternatives
 from django.test import override_settings
 from django.urls import reverse
+from django.utils import formats, timezone
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
+from rest_framework.throttling import ScopedRateThrottle
 
 from openwisp_radius import settings as app_settings
 from openwisp_radius.api.serializers import (
+    PasswordResetSerializer,
+    RadiusBatchSerializer,
     RadiusUserGroupSerializer,
     RadiusUserSerializer,
+    RegisterSerializer,
+    UpdateRegisteredUserMethodSerializer,
     UserGroupCheckSerializer,
 )
+from openwisp_radius.api.views import PasswordResetConfirmView, PasswordResetView
+from openwisp_radius.base.forms import PasswordResetForm
+from openwisp_users.api.serializers import (
+    PasswordResetSerializer as UsersPasswordResetSerializer,
+)
+from openwisp_users.base.forms import PasswordResetForm as UsersPasswordResetForm
 from openwisp_utils.tests import capture_any_output, capture_stderr
 
 from ...utils import load_model
@@ -41,6 +54,7 @@ RadiusToken = load_model("RadiusToken")
 RadiusBatch = load_model("RadiusBatch")
 RadiusUserGroup = load_model("RadiusUserGroup")
 RadiusGroup = load_model("RadiusGroup")
+RegisteredUser = load_model("RegisteredUser")
 OrganizationRadiusSettings = load_model("OrganizationRadiusSettings")
 Organization = swapper.load_model("openwisp_users", "Organization")
 OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
@@ -54,15 +68,44 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         cache.clear()
         super().setUp()
 
+    def test_password_reset_uses_scoped_throttle(self):
+        for view in (PasswordResetView, PasswordResetConfirmView):
+            with self.subTest(view=view.__name__):
+                self.assertIn(ScopedRateThrottle, view.throttle_classes)
+
     def _radius_batch_post_request(self, data, username="admin", password="tester"):
         if username == "admin":
             self._get_admin()
         login_payload = {"username": username, "password": password}
         login_url = reverse("radius:user_auth_token", args=[self.default_org.slug])
         login_response = self.client.post(login_url, data=login_payload)
-        header = f'Bearer {login_response.json()["key"]}'
+        header = f"Bearer {login_response.json()['key']}"
         url = reverse("radius:batch")
         return self.client.post(url, data, HTTP_AUTHORIZATION=header)
+
+    def _get_update_method_url(self, org=None):
+        if org is None:
+            org = self.default_org
+        return reverse(
+            "radius:update_registered_user_registration_method", args=[org.slug]
+        )
+
+    def _create_pending_verification_user(self, username_suffix=""):
+        user = self._create_user(
+            username=f"pendinguser{username_suffix}",
+            password="tester",
+            email=f"pendinguser{username_suffix}@test.com",
+        )
+        org2 = self._create_org(name="org2")
+        OrganizationUser.objects.create(user=user, organization=org2)
+        RegisteredUser.objects.create(
+            user=user,
+            organization=org2,
+            method="pending_verification",
+            is_verified=False,
+        )
+        user_token = Token.objects.create(user=user)
+        return user, org2, user_token
 
     def test_batch_bad_request_400(self):
         self.assertEqual(RadiusBatch.objects.count(), 0)
@@ -159,7 +202,10 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         user = User.objects.get(email=self._test_email)
         self.assertTrue(user.is_member(self.default_org))
         self.assertTrue(user.is_active)
-        self.assertFalse(user.registered_user.is_verified)
+        self.assertEqual(
+            user.registered_users.get(organization=self.default_org).is_verified,
+            False,
+        )
 
     def test_register_400_password(self):
         response = self._register_user(
@@ -215,14 +261,17 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         radius_settings = org2.radius_settings
         radius_settings.sms_verification = True
         radius_settings.save()
+        existing_user = User.objects.get(email=self._test_email)
+        EmailAddress.objects.filter(user=existing_user).update(verified=True)
 
         with self.subTest("Test existing email"):
             options = params.copy()
-            options["phone_number"] = "+393664255803"
+            options["email"] = self._test_email.upper()
+            options["phone_number"] = "+393664255804"
             options["username"] = "test2"
 
             response = self.client.post(url, data=options)
-            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.status_code, 409, response.data)
             expected_response_data = {
                 "details": "A user like the one being registered already exists.",
                 "organizations": [
@@ -319,19 +368,27 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
     def test_radius_user_serializer(self):
         self._register_user()
         try:
-            user = User.objects.select_related("radius_token", "registered_user").get(
-                email=self._test_email
+            user = (
+                User.objects.select_related("radius_token")
+                .prefetch_related("registered_users")
+                .get(email=self._test_email)
             )
-            admin = User.objects.select_related("radius_token", "registered_user").get(
-                username="admin"
+            admin = (
+                User.objects.select_related("radius_token")
+                .prefetch_related("registered_users")
+                .get(username="admin")
             )
         except User.DoesNotExist as e:
             self.fail(f"user not found: {e}")
 
         with self.assertNumQueries(0):
-            data = RadiusUserSerializer(user).data
+            # Organization is required to get the RegisteredUser object
+            view = mock.MagicMock()
+            view.organization = self.default_org
+            data = RadiusUserSerializer(user, context={"view": view}).data
 
         with self.subTest("test full data"):
+            registered_user = user.registered_users.get(organization=self.default_org)
             self.assertEqual(
                 data,
                 {
@@ -343,9 +400,9 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
                     "birth_date": user.birth_date,
                     "location": user.location,
                     "is_active": user.is_active,
-                    "is_verified": user.registered_user.is_verified,
                     "password_expired": user.has_password_expired(),
-                    "method": user.registered_user.method,
+                    "is_verified": registered_user.is_verified,
+                    "method": registered_user.method,
                     "radius_user_token": user.radius_token.key,
                 },
             )
@@ -369,6 +426,44 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
                     "radius_user_token": None,
                 },
             )
+
+        with self.subTest("org-specific record is returned for the current org"):
+            user2 = self._create_user(username="user2", email="user2@test.com")
+            self._create_org_user(user=user2, organization=self.default_org)
+            RegisteredUser.objects.create(
+                user=user2,
+                organization=self.default_org,
+                is_verified=True,
+                method="mobile_phone",
+            )
+            url = reverse("radius:user_auth_token", args=[self.default_org.slug])
+            r = self.client.post(url, {"username": "user2", "password": "tester"})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.data["is_verified"], True)
+            self.assertEqual(r.data["method"], "mobile_phone")
+
+        with self.subTest("other-organization record is not used as fallback"):
+            user3 = self._create_user(username="user3", email="user3@test.com")
+            self._create_org_user(user=user3, organization=self.default_org)
+            org2 = self._create_org(name="serializer-org2", slug="serializer-org2")
+            self._create_org_user(user=user3, organization=org2)
+            RegisteredUser.objects.create(
+                user=user3, organization=org2, is_verified=True, method="email"
+            )
+            url = reverse("radius:user_auth_token", args=[self.default_org.slug])
+            r = self.client.post(url, {"username": "user3", "password": "tester"})
+            self.assertEqual(r.status_code, 200)
+            self.assertIsNone(r.data["is_verified"])
+            self.assertIsNone(r.data["method"])
+
+        with self.subTest("returns None when no RegisteredUser records exist"):
+            user4 = self._create_user(username="user4", email="user4@test.com")
+            self._create_org_user(user=user4, organization=self.default_org)
+            url = reverse("radius:user_auth_token", args=[self.default_org.slug])
+            r = self.client.post(url, {"username": "user4", "password": "tester"})
+            self.assertEqual(r.status_code, 200)
+            self.assertIsNone(r.data["is_verified"])
+            self.assertIsNone(r.data["method"])
 
     # The fallback value is set on project startup, hence it also requires mocking.
     @mock.patch.object(
@@ -490,6 +585,54 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             self.assertEqual(r.status_code, 201)
             self.assertEqual(User.objects.count(), 2)
 
+    def test_register_serializer_user_settable_methods(self):
+        url = reverse("radius:rest_register", args=[self.default_org.slug])
+        for method in ["saml", "social_login"]:
+            with self.subTest(f"RegisterSerializer rejects {method}"):
+                response = self.client.post(
+                    url,
+                    {
+                        "username": f"{method}@example.com",
+                        "email": f"{method}@example.com",
+                        "password1": "password",
+                        "password2": "password",
+                        "method": method,
+                    },
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    '"{input}" is not a valid choice.'.format(input=method),
+                    response.data["method"],
+                )
+
+        with self.subTest("custom configured method is accepted"):
+            with mock.patch.object(
+                app_settings,
+                "USER_SETTABLE_REGISTRATION_METHODS",
+                ["", "email", "manual"],
+            ):
+                serializer = RegisterSerializer(context={"view": mock.MagicMock()})
+                self.assertEqual(
+                    list(serializer.fields["method"].choices.keys()),
+                    ["", "email", "manual"],
+                )
+                response = self.client.post(
+                    url,
+                    {
+                        "username": "manual@example.com",
+                        "email": "manual@example.com",
+                        "password1": "password",
+                        "password2": "password",
+                        "method": "manual",
+                    },
+                )
+                self.assertEqual(response.status_code, 201)
+                registered_user = RegisteredUser.objects.get(
+                    user__username="manual@example.com",
+                    organization=self.default_org,
+                )
+                self.assertEqual(registered_user.method, "manual")
+
     @override_settings(
         ACCOUNT_EMAIL_VERIFICATION="mandatory", ACCOUNT_EMAIL_REQUIRED=True
     )
@@ -567,6 +710,22 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             )
             pdf_response = self.client.get(pdf_link)
             self.assertEqual(pdf_response.status_code, 200)
+
+        with self.subTest("Login: staff manager without batch permission"):
+            staff = self._create_user(
+                username="pdf-no-permission",
+                email="pdf-no-permission@test.com",
+                is_staff=True,
+            )
+            self._create_org_user(
+                organization=self.default_org,
+                user=staff,
+                is_admin=True,
+            )
+            self.client.force_login(staff)
+            pdf_response = self.client.get(pdf_link)
+            self.assertEqual(pdf_response.status_code, 403)
+
         with self.subTest("Login: superuser allowed"):
             self.client.force_login(self._get_admin())
             pdf_response = self.client.get(pdf_link)
@@ -646,6 +805,54 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.client.force_login(self._get_operator())
         response = self.client.get(url)
         self.assertEqual(response.status_code, 403)
+
+    def test_radius_batch_serializer_fields_order(self):
+        self.assertEqual(
+            list(RadiusBatchSerializer().fields),
+            [
+                "id",
+                "strategy",
+                "organization",
+                "organization_slug",
+                "status",
+                "name",
+                "csvfile",
+                "prefix",
+                "number_of_users",
+                "group",
+                "users",
+                "expiration_date",
+                "notes",
+                "user_credentials",
+                "pdf_link",
+                "created",
+                "modified",
+            ],
+        )
+
+    def test_batch_prefix_group_and_notes_201(self):
+        group = self._create_radius_group(name="guests")
+        response = self._radius_batch_post_request(
+            self._radius_batch_prefix_data(group=str(group.pk), notes="Internal note")
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        batch = RadiusBatch.objects.get()
+        self.assertEqual(batch.group, group)
+        self.assertEqual(batch.notes, "Internal note")
+        for user in batch.users.all():
+            self.assertTrue(
+                RadiusUserGroup.objects.filter(user=user, group=group).exists()
+            )
+
+    def test_batch_rejects_group_from_different_organization(self):
+        organization = self._create_org(name="other organization", slug="other-org")
+        group = self._create_radius_group(name="guests", organization=organization)
+        response = self._radius_batch_post_request(
+            self._radius_batch_prefix_data(group=str(group.pk))
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("group", response.data)
+        self.assertEqual(RadiusBatch.objects.count(), 0)
 
     @capture_any_output()
     def test_api_password_change(self):
@@ -791,18 +998,22 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = self.client.post(password_reset_url, data={})
         self.assertEqual(response.status_code, 400)
 
-        # email does not exist in database
+        # email does not exist in database: indistinguishable from a match,
+        # to avoid leaking which identifiers are registered
         reset_payload = {"input": "wrong@email.com"}
         response = self.client.post(password_reset_url, data=reset_payload)
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), mail_count)
 
-        # email not registered with org
+        # email not registered with org: also indistinguishable from a
+        # match, to avoid leaking organization membership
         User.objects.create_user(
             username="test_name1", password="test_password", email="test1@email.com"
         )
         reset_payload = {"input": "test1@email.com"}
         response = self.client.post(password_reset_url, data=reset_payload)
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), mail_count)
 
         # valid payload
         reset_payload = {"input": "test@email.com"}
@@ -836,7 +1047,9 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         confirm_response = self.client.post(password_confirm_url, data=data)
         self.assertEqual(confirm_response.status_code, 400)
 
-        # wrong uid
+        # wrong uid: the uid/token pair is already an unguessable secret,
+        # so there is nothing left to enumerate here, hence a plain 400
+        # rather than a 404 (see PasswordResetConfirmView docstring)
         data = {
             "new_password1": "test_new_password",
             "new_password2": "test_new_password",
@@ -844,7 +1057,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             "token": url_kwargs["token"],
         }
         confirm_response = self.client.post(password_confirm_url, data=data)
-        self.assertEqual(confirm_response.status_code, 404)
+        self.assertEqual(confirm_response.status_code, 400)
 
         # wrong token and uid
         data = {
@@ -854,7 +1067,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             "token": "-wrong-token-",
         }
         confirm_response = self.client.post(password_confirm_url, data=data)
-        self.assertEqual(confirm_response.status_code, 404)
+        self.assertEqual(confirm_response.status_code, 400)
 
         # valid payload
         data = {
@@ -910,13 +1123,183 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = self.client.get(password_reset_url)
         self.assertEqual(response.status_code, 405)
 
+    def test_api_password_reset_superuser_without_organization_membership(self):
+        user = User.objects.create_superuser(
+            username="superuser",
+            email="superuser@example.com",
+            password="test_password",
+        )
+        self.assertFalse(user.is_member(self.default_org))
+        password_reset_url = reverse(
+            "radius:rest_password_reset", args=[self.default_org.slug]
+        )
+        response = self.client.post(password_reset_url, data={"input": user.email})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [user.email])
+
+    def test_password_reset_form_deprecated(self):
+        with self.assertWarns(DeprecationWarning):
+            form = PasswordResetForm(data={"email": "test@example.com"})
+        self.assertIsInstance(form, UsersPasswordResetForm)
+
+    def test_password_reset_serializer_deprecated(self):
+        with self.assertWarns(DeprecationWarning):
+            serializer = PasswordResetSerializer(data={"input": "test@example.com"})
+        self.assertIsInstance(serializer, UsersPasswordResetSerializer)
+
+    def test_get_password_reset_url_default(self):
+        test_user = User.objects.create_user(
+            username="test_name",
+            password="test_password",
+            email="test@email.com",
+        )
+        self._create_org_user(organization=self.default_org, user=test_user)
+        password_reset_url = reverse(
+            "radius:rest_password_reset", args=[self.default_org.slug]
+        )
+        reset_payload = {"input": "test@email.com"}
+        response = self.client.post(password_reset_url, data=reset_payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox.pop()
+        email_body = email.alternatives[0][0]
+        uid = user_pk_to_url_str(test_user)
+        self.assertIn(self.default_org.slug, email_body)
+        self.assertIn("Reset password", email_body)
+        self.assertIn(f"password/reset/confirm/{uid}/", email_body)
+
+    def test_get_password_reset_url_org_radius_settings(self):
+        """Test password reset URL from org radius_settings."""
+        test_user = User.objects.create_user(
+            username="test_name",
+            password="test_password",
+            email="test@email.com",
+        )
+        self._create_org_user(organization=self.default_org, user=test_user)
+        self.default_org.radius_settings.password_reset_url = (
+            "https://custom.example.com/reset?org={organization}"
+            "&uid={uid}&token={token}&site={site}"
+        )
+        self.default_org.radius_settings.save()
+        password_reset_url = reverse(
+            "radius:rest_password_reset", args=[self.default_org.slug]
+        )
+        reset_payload = {"input": "test@email.com"}
+        response = self.client.post(password_reset_url, data=reset_payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox.pop()
+        email_body = email.alternatives[0][0]
+        uid = user_pk_to_url_str(test_user)
+        site_domain = Site.objects.get_current().domain
+        self.assertIn(
+            f"https://custom.example.com/reset?org={self.default_org.slug}"
+            f"&amp;uid={uid}&amp;token=",
+            email_body,
+        )
+        self.assertIn(f"&amp;site={site_domain}", email_body)
+
+    def test_get_password_reset_url_org_radius_settings_precedence(self):
+        test_user = User.objects.create_user(
+            username="test_name",
+            password="test_password",
+            email="test@email.com",
+        )
+        self._create_org_user(organization=self.default_org, user=test_user)
+        self.default_org.radius_settings.password_reset_url = (
+            "https://org-override.example.com/{organization}/{uid}/{token}"
+        )
+        self.default_org.radius_settings.save()
+        password_reset_urls = {
+            str(self.default_org.pk): (
+                "https://org-specific.example.com/{organization}/{uid}/{token}"
+            )
+        }
+        password_reset_url = reverse(
+            "radius:rest_password_reset", args=[self.default_org.slug]
+        )
+        reset_payload = {"input": "test@email.com"}
+        with mock.patch.object(
+            app_settings, "PASSWORD_RESET_URLS", password_reset_urls
+        ):
+            response = self.client.post(password_reset_url, data=reset_payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox.pop()
+        email_body = email.alternatives[0][0]
+        self.assertIn("https://org-override.example.com/", email_body)
+        self.assertNotIn("https://org-specific.example.com/", email_body)
+
+    def test_get_password_reset_url_password_reset_urls_org_specific(self):
+        test_user = User.objects.create_user(
+            username="test_name",
+            password="test_password",
+            email="test@email.com",
+        )
+        self._create_org_user(organization=self.default_org, user=test_user)
+        self.assertEqual(
+            self.default_org.radius_settings.password_reset_url,
+            app_settings.DEFAULT_PASSWORD_RESET_URL,
+        )
+        uid = user_pk_to_url_str(test_user)
+        password_reset_urls = {
+            str(self.default_org.pk): (
+                "https://org-specific.example.com/{organization}/{uid}/{token}"
+            )
+        }
+        password_reset_url = reverse(
+            "radius:rest_password_reset", args=[self.default_org.slug]
+        )
+        reset_payload = {"input": "test@email.com"}
+        with mock.patch.object(
+            app_settings, "PASSWORD_RESET_URLS", password_reset_urls
+        ):
+            response = self.client.post(password_reset_url, data=reset_payload)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        email = mail.outbox.pop()
+        email_body = email.alternatives[0][0]
+        self.assertIn(
+            f"https://org-specific.example.com/{self.default_org.slug}/{uid}/",
+            email_body,
+        )
+
+    def test_api_password_reset_confirm_json_enforces_membership(self):
+        other_org = self._create_org(name="other-org")
+        user = User.objects.create_user(
+            username="other-org-user",
+            password="test_password",
+            email="other-org-user@email.com",
+        )
+        self._create_org_user(organization=other_org, user=user)
+        data = {
+            "new_password1": "test_new_password",
+            "new_password2": "test_new_password",
+            "uid": user_pk_to_url_str(user),
+            "token": default_token_generator.make_token(user),
+        }
+        password_confirm_url = reverse(
+            "radius:rest_password_reset_confirm", args=[self.default_org.slug]
+        )
+        response = self.client.post(
+            password_confirm_url,
+            data=json.dumps(data),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("non_field_errors", response.data)
+        self.assertIn("is not member", str(response.data["non_field_errors"]))
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("test_password"))
+
     def test_user_accounting_list_200(self):
         auth_url = reverse("radius:user_auth_token", args=[self.default_org.slug])
         self._get_org_user()
         response = self.client.post(
             auth_url, {"username": "tester", "password": "tester"}
         )
-        authorization = f'Bearer {response.data["key"]}'
+        authorization = f"Bearer {response.data['key']}"
         stop_time = "2018-03-02T11:43:24.020460+01:00"
         data1 = self.acct_post_data
         data1.update(
@@ -997,9 +1380,14 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self._create_org_user(user=user, organization=org)
         path = reverse("radius:rest_password_reset", args=[org.slug])
         r = self.client.post(path, {"input": user.email})
+        # The reset password view does not leak whether an account exists or not.
+        # It returns success response in both cases.
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.data["detail"], "Password reset e-mail has been sent.")
-        mocked_send.assert_called_once()
+        if is_active:
+            mocked_send.assert_called_once()
+        else:
+            mocked_send.assert_not_called()
 
     def test_active_user_reset_password(self):
         self._test_user_reset_password_helper(True)
@@ -1557,6 +1945,201 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(serializer._user, None)
         self.assertEqual(serializer.fields["group"].queryset.count(), 0)
 
+    def test_update_registered_user_method_success(self):
+        user, org2, user_token = self._create_pending_verification_user(
+            username_suffix="_success"
+        )
+        url = self._get_update_method_url(org2)
+        response = self.client.post(
+            url,
+            {"method": "mobile_phone"},
+            HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["method"], "mobile_phone")
+        registered_user = RegisteredUser.objects.get(user=user, organization=org2)
+        self.assertEqual(registered_user.method, "mobile_phone")
+        self.assertEqual(registered_user.is_verified, False)
+
+    def test_update_registered_user_method_with_valid_methods(self):
+        user, org2, user_token = self._create_pending_verification_user(
+            username_suffix="_valid"
+        )
+        url = self._get_update_method_url(org2)
+        for method in ["", "email", "mobile_phone"]:
+            with self.subTest(method=method):
+                registered_user = RegisteredUser.objects.get(
+                    user=user, organization=org2
+                )
+                registered_user.method = "pending_verification"
+                registered_user.save()
+                response = self.client.post(
+                    url,
+                    {"method": method},
+                    HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data["method"], method)
+
+    @mock.patch.object(
+        app_settings,
+        "USER_SETTABLE_REGISTRATION_METHODS",
+        ["", "email", "mobile_phone"],
+    )
+    def test_update_registered_user_method_user_settable_methods(self):
+        _, org2, user_token = self._create_pending_verification_user(
+            username_suffix="_choices"
+        )
+        url = self._get_update_method_url(org2)
+
+        with self.subTest("default field choices"):
+            serializer = UpdateRegisteredUserMethodSerializer()
+            self.assertEqual(
+                list(serializer.fields["method"].choices.keys()),
+                ["", "email", "mobile_phone"],
+            )
+
+        for method in ["saml", "social_login"]:
+            with self.subTest(f"UpdateRegisteredUserMethodSerializer rejects {method}"):
+                response = self.client.post(
+                    url,
+                    {"method": method},
+                    HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    '"{input}" is not a valid choice.'.format(input=method),
+                    response.data["method"],
+                )
+
+        with self.subTest("custom configured method is accepted"):
+            with mock.patch.object(
+                app_settings,
+                "USER_SETTABLE_REGISTRATION_METHODS",
+                ["", "email", "manual"],
+            ):
+                serializer = UpdateRegisteredUserMethodSerializer()
+                self.assertEqual(
+                    list(serializer.fields["method"].choices.keys()),
+                    ["", "email", "manual"],
+                )
+                response = self.client.post(
+                    url,
+                    {"method": "manual"},
+                    HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data["method"], "manual")
+
+    def test_update_registered_user_method_validation_errors(self):
+        user, org2, user_token = self._create_pending_verification_user()
+        url = self._get_update_method_url(org2)
+        with self.subTest("reject_pending_verification_as_input"):
+            response = self.client.post(
+                url,
+                {"method": "pending_verification"},
+                HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+            )
+            self.assertEqual(response.status_code, 400)
+
+        with self.subTest("reject_invalid_method"):
+            response = self.client.post(
+                url,
+                {"method": "invalid_method"},
+                HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+            )
+            self.assertEqual(response.status_code, 400)
+
+        with self.subTest("reject_non_pending_state"):
+            registered_user = RegisteredUser.objects.get(user=user, organization=org2)
+            registered_user.method = "mobile_phone"
+            registered_user.save()
+            response = self.client.post(
+                url,
+                {"method": "email"},
+                HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("pending verification", response.data["method"][0])
+
+    def test_update_registered_user_method_404_cases(self):
+        with self.subTest("non member without registered user"):
+            user = self._create_user(username="noreguser", password="tester")
+            user_token = Token.objects.create(user=user)
+            url = self._get_update_method_url()
+            response = self.client.post(
+                url,
+                {"method": "mobile_phone"},
+                HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("non_field_errors", response.data)
+            self.assertIn("is not member", str(response.data["non_field_errors"]))
+
+        with self.subTest("non member cannot update other users record"):
+            user, org2, user_token = self._create_pending_verification_user(
+                username_suffix="_owner"
+            )
+            other_user = self._create_user(
+                username="otheruser", password="tester", email="otheruser@test.com"
+            )
+            other_user_token = Token.objects.create(user=other_user)
+            url = self._get_update_method_url(org2)
+            response = self.client.post(
+                url,
+                {"method": "mobile_phone"},
+                HTTP_AUTHORIZATION=f"Bearer {other_user_token.key}",
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("non_field_errors", response.data)
+            self.assertIn("is not member", str(response.data["non_field_errors"]))
+
+        with self.subTest("invalid_org"):
+            user, _, user_token = self._create_pending_verification_user(
+                username_suffix="_invalid_org"
+            )
+            url = reverse(
+                "radius:update_registered_user_registration_method",
+                args=["nonexistent-org-slug"],
+            )
+            response = self.client.post(
+                url,
+                {"method": "mobile_phone"},
+                HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+            )
+            self.assertEqual(response.status_code, 404)
+
+    def test_update_registered_user_method_rejects_non_member_with_registered_user(
+        self,
+    ):
+        user = self._create_user(
+            username="nonmember-update",
+            password="tester",
+            email="nonmember-update@test.com",
+        )
+        org = self._create_org(name="org-update", slug="org-update")
+        RegisteredUser.objects.create(
+            user=user,
+            organization=org,
+            method="pending_verification",
+            is_verified=False,
+        )
+        user_token = Token.objects.create(user=user)
+        url = self._get_update_method_url(org)
+        response = self.client.post(
+            url,
+            {"method": "mobile_phone"},
+            HTTP_AUTHORIZATION=f"Bearer {user_token.key}",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("non_field_errors", response.data)
+        self.assertIn("is not member", str(response.data["non_field_errors"]))
+
+    def test_update_registered_user_method_requires_authentication(self):
+        url = self._get_update_method_url()
+        response = self.client.post(url, {"method": "mobile_phone"})
+        self.assertEqual(response.status_code, 401)
+
 
 class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
     def test_user_radius_usage_view(self):
@@ -1566,7 +2149,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
         response = self.client.post(
             auth_url, {"username": "tester", "password": "tester"}
         )
-        authorization = f'Bearer {response.data["key"]}'
+        authorization = f"Bearer {response.data['key']}"
         self.assertEqual(response.status_code, 200)
         with self.subTest("Test user has not used any data"):
             response = self.client.get(usage_url, HTTP_AUTHORIZATION=authorization)
@@ -1762,9 +2345,11 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                 organization=org1,
                 calling_station_id="11:22:33:44:55:66",
                 called_station_id="AA:BB:CC:DD:EE:FF",
+                start_time="2025-02-12T18:29:00+00:00",
+                stop_time="2025-02-12T18:39:00+00:00",
             )
         )
-        self._create_radius_accounting(**data1)
+        ra1 = self._create_radius_accounting(**data1)
         data2 = self.acct_post_data
         data2.update(
             dict(
@@ -1778,7 +2363,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                 called_station_id="AA-BB-CC-DD-EE-FF",
             )
         )
-        self._create_radius_accounting(**data2)
+        ra2 = self._create_radius_accounting(**data2)
         data3 = self.acct_post_data
         data3.update(
             dict(
@@ -1812,6 +2397,19 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
             self.assertEqual(len(response.data), 2)
             self.assertEqual(response.data[0]["unique_id"], data2["unique_id"])
             self.assertEqual(response.data[1]["unique_id"], data1["unique_id"])
+            self.assertEqual(
+                response.data[0]["start_time_display"],
+                formats.localize(timezone.template_localtime(ra2.start_time)),
+            )
+            self.assertIsNone(response.data[0]["stop_time_display"])
+            self.assertEqual(
+                response.data[1]["start_time_display"],
+                formats.localize(timezone.template_localtime(ra1.start_time)),
+            )
+            self.assertEqual(
+                response.data[1]["stop_time_display"],
+                formats.localize(timezone.template_localtime(ra1.stop_time)),
+            )
 
         with self.subTest("Test superuser can view all sessions"):
             admin = self._create_admin()
@@ -1848,7 +2446,6 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
             self.assertEqual(
                 response.data[1]["calling_station_id"], "11:22:33:44:55:66"
             )
-
             response = self.client.get(
                 path, {"calling_station_id": "11:22:33:44:55:66"}
             )

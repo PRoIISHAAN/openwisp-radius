@@ -2,10 +2,14 @@ from unittest import mock
 
 import lxml.html as lxml_html
 import swapper
+from django.contrib import admin
+from django.contrib.admin.models import LogEntry
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.contrib.messages import get_messages
 from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
+from django.test import RequestFactory
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
 
@@ -229,10 +233,11 @@ class TestAdmin(
 
     def test_radiusbatch_change(self):
         obj = self._create_radius_batch(
+            organization=self.default_org,
             name="test",
             strategy="prefix",
             prefix="test-prefix4",
-            expiration_date="1998-01-28",
+            expiration_date="2098-01-28",
         )
         url = reverse(f"admin:{self.app_label}_radiusbatch_change", args=[obj.pk])
         response = self.client.get(url)
@@ -241,10 +246,11 @@ class TestAdmin(
 
     def test_radiusbatch_change_contains_pdf_download(self):
         obj = self._create_radius_batch(
+            organization=self.default_org,
             name="test-prefix17",
             strategy="prefix",
             prefix="test-prefix17",
-            expiration_date="1998-01-28",
+            expiration_date="2098-01-28",
         )
         url = reverse(f"admin:{self.app_label}_radiusbatch_change", args=[obj.pk])
         response = self.client.get(url)
@@ -382,6 +388,44 @@ class TestAdmin(
         self.assertEqual(response.status_code, 200)
         self.assertEqual(User.objects.count() - n, 0)
 
+    def test_radiusbatch_delete_view_skips_processing(self):
+        batch = self._create_radius_batch(
+            name="processing",
+            strategy="prefix",
+            prefix="test-proc",
+            status=RadiusBatch.PROCESSING,
+        )
+        delete_path = reverse(
+            f"admin:{self.app_label}_radiusbatch_delete", args=[batch.pk]
+        )
+        # The permission check must reject a processing batch before Django logs it.
+        log_entries = LogEntry.objects.count()
+        response = self.client.post(delete_path, {"post": "yes"}, follow=True)
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(RadiusBatch.objects.filter(pk=batch.pk).exists())
+        self.assertEqual(LogEntry.objects.count(), log_entries)
+
+    @mock.patch.object(RadiusBatch, "can_delete", return_value=True)
+    def test_radiusbatch_delete_model_processing_error_message(
+        self, _mocked_can_delete
+    ):
+        batch = self._create_radius_batch(
+            name="processing",
+            strategy="prefix",
+            prefix="test-proc",
+            status=RadiusBatch.PROCESSING,
+        )
+        delete_path = reverse(
+            f"admin:{self.app_label}_radiusbatch_delete", args=[batch.pk]
+        )
+        response = self.client.post(delete_path, {"post": "yes"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            str(list(get_messages(response.wsgi_request))[0]),
+            "The radius batch object is currently being processed and cannot be "
+            "deleted.",
+        )
+
     def test_delete_selected_batches_action_perms(self):
         org = self._get_org()
         user = self._create_user(is_staff=True)
@@ -391,17 +435,84 @@ class TestAdmin(
             name="test",
             strategy="prefix",
             prefix="test-prefix4",
-            expiration_date="1998-01-28",
+            expiration_date="2098-01-28",
         )
         self._test_action_permission(
             path=reverse(f"admin:{self.app_label}_radiusbatch_changelist"),
             action="delete_selected_batches",
             user=user,
             obj=batch,
-            message="Successfully deleted selected batches.",
+            message="Successfully deleted 1 batch.",
             required_perms=["delete"],
             extra_payload={"_selected_action": [batch.id]},
         )
+
+    def test_delete_selected_batches_skips_processing(self):
+        org = self._get_org()
+        self._get_admin()
+        deletable = self._create_radius_batch(
+            organization=org,
+            name="deletable",
+            strategy="prefix",
+            prefix="test-del",
+        )
+        processing = self._create_radius_batch(
+            organization=org,
+            name="processing",
+            strategy="prefix",
+            prefix="test-proc",
+        )
+        processing.status = RadiusBatch.PROCESSING
+        processing.save(update_fields=["status"])
+        changelist_path = reverse(f"admin:{self.app_label}_radiusbatch_changelist")
+        data = {
+            "action": "delete_selected_batches",
+            "_selected_action": [deletable.pk, processing.pk],
+        }
+        response = self.client.post(changelist_path, data, follow=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(RadiusBatch.objects.filter(pk=deletable.pk).exists())
+        self.assertTrue(RadiusBatch.objects.filter(pk=processing.pk).exists())
+        self.assertContains(response, "Skipped 1 batch")
+        self.assertContains(response, "Successfully deleted 1 batch.")
+
+    @mock.patch.object(RadiusBatch, "delete_if_not_processing", autospec=True)
+    def test_delete_selected_batches_ignores_disappeared_batch(self, delete_batch):
+        org = self._get_org()
+        self._get_admin()
+        disappeared = self._create_radius_batch(
+            organization=org,
+            name="disappeared",
+            strategy="prefix",
+            prefix="test-dis",
+        )
+        deletable = self._create_radius_batch(
+            organization=org,
+            name="deletable",
+            strategy="prefix",
+            prefix="test-del",
+        )
+
+        def delete_or_disappear(batch):
+            if batch.pk == disappeared.pk:
+                RadiusBatch.objects.filter(pk=batch.pk).delete()
+                raise RadiusBatch.DoesNotExist
+            batch.delete()
+
+        delete_batch.side_effect = delete_or_disappear
+        changelist_path = reverse(f"admin:{self.app_label}_radiusbatch_changelist")
+        response = self.client.post(
+            changelist_path,
+            {
+                "action": "delete_selected_batches",
+                "_selected_action": [disappeared.pk, deletable.pk],
+            },
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(RadiusBatch.objects.filter(pk=disappeared.pk).exists())
+        self.assertFalse(RadiusBatch.objects.filter(pk=deletable.pk).exists())
+        self.assertContains(response, "Successfully deleted 1 batch.")
 
     def test_radius_batch_csv_help_text(self):
         add_url = reverse(f"admin:{self.app_label}_radiusbatch_add")
@@ -424,7 +535,7 @@ class TestAdmin(
         path = self._get_path("static/test_batch.csv")
         csvfile = open(path, "rt")
         data = {
-            "expiration_date": "2019-03-20",
+            "expiration_date": "2099-03-20",
             "strategy": "csv",
             "csvfile": csvfile,
             "name": "test1",
@@ -434,7 +545,7 @@ class TestAdmin(
 
     def _get_prefix_post_data(self):
         data = {
-            "expiration_date": "2019-03-20",
+            "expiration_date": "2099-03-20",
             "strategy": "prefix",
             "prefix": "test-prefix12",
             "number_of_users": 10,
@@ -671,16 +782,19 @@ class TestAdmin(
             f"admin:{self.app_label_users}_organization_add",
         )
         PASSWORD_RESET_URLS = {"default": default_password_reset_url}
-        with mock.patch.object(
-            app_settings,
-            "DEFAULT_PASSWORD_RESET_URL",
-            app_settings.get_default_password_reset_url(PASSWORD_RESET_URLS),
-        ), mock.patch.object(
-            # The default value is set on project startup, hence
-            # it also requires mocking.
-            OrganizationRadiusSettings._meta.get_field("password_reset_url"),
-            "fallback",
-            app_settings.DEFAULT_PASSWORD_RESET_URL,
+        with (
+            mock.patch.object(
+                app_settings,
+                "DEFAULT_PASSWORD_RESET_URL",
+                app_settings.get_default_password_reset_url(PASSWORD_RESET_URLS),
+            ),
+            mock.patch.object(
+                # The default value is set on project startup, hence
+                # it also requires mocking.
+                OrganizationRadiusSettings._meta.get_field("password_reset_url"),
+                "fallback",
+                app_settings.DEFAULT_PASSWORD_RESET_URL,
+            ),
         ):
             response = self.client.get(url)
             self.assertContains(response, default_password_reset_url)
@@ -1090,6 +1204,77 @@ class TestAdmin(
             html=True,
         )
 
+    def test_radius_batch_group_and_notes(self):
+        group = self._create_radius_group(name="guests")
+        fields = admin.site._registry[RadiusBatch].fields
+        self.assertEqual(fields[fields.index("number_of_users") + 1], "group")
+        self.assertEqual(fields[fields.index("expiration_date") + 1], "notes")
+        add_url = reverse(f"admin:{self.app_label}_radiusbatch_add")
+        response = self.client.get(add_url)
+        self.assertContains(response, 'name="group"')
+        self.assertContains(response, "data-default-url")
+        data = self._get_prefix_post_data()
+        data.update(group=str(group.pk), notes="Internal note")
+        response = self.client.post(add_url, data, follow=True)
+        self.assertEqual(response.status_code, 200)
+        batch = RadiusBatch.objects.get()
+        self.assertEqual(batch.group, group)
+        self.assertEqual(batch.notes, "Internal note")
+        change_url = reverse(
+            f"admin:{self.app_label}_radiusbatch_change", args=[batch.pk]
+        )
+        response = self.client.get(change_url)
+        self.assertContains(response, "field-group")
+        self.assertContains(response, "field-notes")
+        self.assertNotContains(response, 'id="id_group"')
+        self.assertContains(response, 'id="id_notes"')
+        batch.status = RadiusBatch.PENDING
+        readonly_fields = admin.site._registry[RadiusBatch].get_readonly_fields(
+            RequestFactory().get(add_url), batch
+        )
+        self.assertIn("group", readonly_fields)
+
+    def test_radius_batch_default_group(self):
+        url = reverse(
+            f"admin:{self.app_label}_radiusbatch_default_group",
+            args=[self.default_org.pk],
+        )
+        response = self.client.get(url)
+        group = RadiusGroup.objects.get(organization=self.default_org, default=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"id": str(group.pk), "text": str(group)})
+        staff_user = self._create_user(
+            username="batch-operator",
+            email="batch-operator@example.com",
+            is_staff=True,
+        )
+        self._create_org_user(user=staff_user, is_admin=True)
+        self.client.force_login(staff_user)
+
+        with self.subTest("without RadiusGroup view permission"):
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 403)
+
+        operator = self._get_operator()
+        self._create_org_user(user=operator, is_admin=True)
+        self.client.force_login(operator)
+
+        with self.subTest("managed organization"):
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"id": str(group.pk), "text": str(group)})
+
+        with self.subTest("unmanaged organization"):
+            other_organization = self._create_org(
+                name="other organization", slug="other-org"
+            )
+            other_url = reverse(
+                f"admin:{self.app_label}_radiusbatch_default_group",
+                args=[other_organization.pk],
+            )
+            response = self.client.get(other_url)
+            self.assertEqual(response.status_code, 404)
+
     def test_radius_usergroup_queryset(self):
         data = self._create_multitenancy_test_env(usergroup=True)
         self._test_multitenant_admin(
@@ -1359,7 +1544,7 @@ class TestAdmin(
 
         with self.subTest("Inline exists"):
             response = self.client.get(url)
-            self.assertContains(response, "id_registered_user-TOTAL_FORMS")
+            self.assertContains(response, "id_registered_users-TOTAL_FORMS")
 
         with self.subTest("Register new choice"):
             register_registration_method("national_id", "National ID")
@@ -1407,6 +1592,66 @@ class TestAdmin(
             register_registration_method("github", "GitHub", strong_identity=False)
             self.assertIn("github", RegisteredUser._weak_verification_methods)
 
+    def test_admin_prevents_duplicate_registered_user_same_org(self):
+        user = self._create_user(username="dup_test_user", email="dup@test.org")
+        reg_user = RegisteredUser.objects.create(
+            user=user, organization=self.default_org, is_verified=True
+        )
+        user_change_url = reverse(
+            f"admin:{User._meta.app_label}_user_change", args=[user.pk]
+        )
+        response = self.client.get(user_change_url)
+        self.assertEqual(response.status_code, 200)
+        data = {
+            "username": "dup_test_user",
+            "email": "dup@test.org",
+            "registered_users-TOTAL_FORMS": "2",
+            "registered_users-INITIAL_FORMS": "1",
+            "registered_users-MIN_NUM_FORMS": "0",
+            "registered_users-MAX_NUM_FORMS": "1000",
+            "registered_users-0-id": str(reg_user.pk),
+            "registered_users-0-user": str(user.pk),
+            "registered_users-0-organization": str(self.default_org.pk),
+            "registered_users-0-method": "",
+            "registered_users-0-is_verified": "on",
+            "registered_users-1-id": "",
+            "registered_users-1-user": str(user.pk),
+            "registered_users-1-organization": str(self.default_org.pk),
+            "registered_users-1-method": "",
+            "registered_users-1-is_verified": "on",
+        }
+        response = self.client.post(user_change_url, data)
+        self.assertContains(response, "errors")
+        self.assertContains(
+            response,
+            "A user cannot have more than one registration record in the"
+            " same organization.",
+        )
+        self.assertEqual(
+            RegisteredUser.objects.filter(
+                user=user, organization=self.default_org
+            ).count(),
+            1,
+        )
+
+    def test_user_admin_shows_multiple_registered_user_records(self):
+        user = self._create_user(username="multiuser", email="multi@test.org")
+        org2 = self._create_org(name="org2", slug="org2")
+        RegisteredUser.objects.create(
+            user=user, organization=self.default_org, is_verified=True
+        )
+        RegisteredUser.objects.create(user=user, organization=org2, is_verified=False)
+        user_url = reverse(f"admin:{User._meta.app_label}_user_change", args=[user.pk])
+        response = self.client.get(user_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            (
+                '<input type="hidden" name="registered_users-INITIAL_FORMS" value="2"'
+                ' id="id_registered_users-INITIAL_FORMS">'
+            ),
+        )
+
     def test_get_is_verified_user_admin_list(self):
         unknown = User.objects.first()
         self.assertIsNotNone(unknown)
@@ -1416,7 +1661,10 @@ class TestAdmin(
         verified.full_clean()
         verified.save()
         RegisteredUser.objects.create(
-            user=verified, method="mobile_phone", is_verified=True
+            user=verified,
+            organization=self.default_org,
+            method="mobile_phone",
+            is_verified=True,
         )
         unverified = User.objects.create(
             username="unverified", password="unverified", email="unverified@test.com"
@@ -1424,7 +1672,10 @@ class TestAdmin(
         unverified.full_clean()
         unverified.save()
         RegisteredUser.objects.create(
-            user=unverified, method="mobile_phone", is_verified=False
+            user=unverified,
+            organization=self.default_org,
+            method="mobile_phone",
+            is_verified=False,
         )
         app_label = User._meta.app_label
         url = reverse(f"admin:{app_label}_user_changelist")
@@ -1440,6 +1691,22 @@ class TestAdmin(
         self.assertContains(response, get_expected_html("no"))
         self.assertContains(response, get_expected_html("unknown"))
 
+    def test_get_is_verified_user_admin_list_avoids_nplus1_queries(self):
+        app_label = User._meta.app_label
+        path = reverse(f"admin:{app_label}_user_changelist")
+        # Create users
+        for i in range(5):
+            user = self._create_user(username=f"user-{i}", email=f"user-{i}@test.com")
+            RegisteredUser.objects.create(
+                user=user,
+                organization=self.default_org,
+                method="mobile_phone",
+                is_verified=(i % 2 == 0),
+            )
+        with self.assertNumQueries(8):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200)
+
     def test_registered_user_filter(self):
         unknown = User.objects.first()
         self.assertIsNotNone(unknown)
@@ -1449,7 +1716,10 @@ class TestAdmin(
         verified.full_clean()
         verified.save()
         RegisteredUser.objects.create(
-            user=verified, method="mobile_phone", is_verified=True
+            user=verified,
+            organization=self.default_org,
+            method="mobile_phone",
+            is_verified=True,
         )
         unverified = User.objects.create(
             username="unverified", password="unverified", email="unverified@test.com"
@@ -1457,7 +1727,10 @@ class TestAdmin(
         unverified.full_clean()
         unverified.save()
         RegisteredUser.objects.create(
-            user=unverified, method="mobile_phone", is_verified=False
+            user=unverified,
+            organization=self.default_org,
+            method="mobile_phone",
+            is_verified=False,
         )
         app_label = User._meta.app_label
         url = reverse(f"admin:{app_label}_user_changelist")
@@ -1485,6 +1758,130 @@ class TestAdmin(
             self.assertNotContains(response, get_expected_html("yes"))
             self.assertNotContains(response, get_expected_html("no"))
             self.assertContains(response, get_expected_html("unknown"))
+
+    def test_get_is_verified_scoped_to_managed_organizations(self):
+        org1 = self._create_org(name="org-1", slug="org-1")
+        org2 = self._create_org(name="org-2", slug="org-2")
+        manager = self._create_administrator([org1])
+        scoped_user = self._create_user(
+            username="scoped-user",
+            email="scoped-user@test.com",
+        )
+        other_org_user = self._create_user(
+            username="other-org-user",
+            email="other-org-user@test.com",
+        )
+        self._create_org_user(user=scoped_user, organization=org1)
+        self._create_org_user(user=other_org_user, organization=org1)
+        RegisteredUser.objects.create(
+            user=scoped_user,
+            organization=org1,
+            method="mobile_phone",
+            is_verified=False,
+        )
+        RegisteredUser.objects.create(
+            user=scoped_user,
+            organization=org2,
+            method="mobile_phone",
+            is_verified=True,
+        )
+        RegisteredUser.objects.create(
+            user=other_org_user,
+            organization=org2,
+            method="mobile_phone",
+            is_verified=True,
+        )
+        request = RequestFactory().get(
+            reverse(f"admin:{User._meta.app_label}_user_changelist")
+        )
+        request.user = manager
+        user_admin = admin.site._registry[User]
+        queryset = user_admin.get_queryset(request)
+        scoped_user = queryset.get(pk=scoped_user.pk)
+        other_org_user = queryset.get(pk=other_org_user.pk)
+        # The scoped user should show as unverified since the user admin
+        # should only consider the registration record from the managed
+        # organization (org1), while the other org user should show as
+        # unknown since their registration record in the managed
+        # organization is missing
+        self.assertIn("icon-no.svg", user_admin.get_is_verified(scoped_user))
+        self.assertIn("icon-unknown.svg", user_admin.get_is_verified(other_org_user))
+
+    def test_registered_user_filter_scoped_to_managed_organizations(self):
+        org1 = self._create_org(name="org-1", slug="org-1")
+        org2 = self._create_org(name="org-2", slug="org-2")
+        manager = self._create_administrator([org1])
+        org1_verified = self._create_user(
+            username="org1-verified",
+            email="org1-verified@test.com",
+        )
+        common_user_unverified = self._create_user(
+            username="common-user-unverified",
+            email="common-user-unverified@test.com",
+        )
+        org2_registered = self._create_user(
+            username="org2-only",
+            email="org2-only@test.com",
+        )
+        self._create_org_user(user=org1_verified, organization=org1)
+        self._create_org_user(user=common_user_unverified, organization=org1)
+        self._create_org_user(user=org2_registered, organization=org1)
+        RegisteredUser.objects.create(
+            user=org1_verified,
+            organization=org1,
+            method="mobile_phone",
+            is_verified=True,
+        )
+        RegisteredUser.objects.create(
+            user=common_user_unverified,
+            organization=org1,
+            method="mobile_phone",
+            is_verified=False,
+        )
+        RegisteredUser.objects.create(
+            user=common_user_unverified,
+            organization=org2,
+            method="mobile_phone",
+            is_verified=True,
+        )
+        RegisteredUser.objects.create(
+            user=org2_registered,
+            organization=org2,
+            method="mobile_phone",
+            is_verified=True,
+        )
+        self.client.force_login(manager)
+        app_label = User._meta.app_label
+        url = reverse(f"admin:{app_label}_user_changelist")
+
+        response = self.client.get(url, {"is_verified": "true"})
+        self.assertContains(response, org1_verified.username)
+        self.assertNotContains(response, common_user_unverified.username)
+        self.assertNotContains(response, org2_registered.username)
+
+        response = self.client.get(url, {"is_verified": "false"})
+        self.assertContains(response, common_user_unverified.username)
+        self.assertNotContains(response, org1_verified.username)
+        self.assertNotContains(response, org2_registered.username)
+
+        response = self.client.get(url, {"is_verified": "unknown"})
+        self.assertContains(response, org2_registered.username)
+        self.assertNotContains(response, org1_verified.username)
+        self.assertNotContains(response, common_user_unverified.username)
+
+    def test_registered_user_filter_does_not_limit_default_changelist(self):
+        org = self._create_org(name="org-filter-default", slug="org-filter-default")
+        manager = self._create_administrator([org])
+        user = self._create_user(
+            username="no-registered-user",
+            email="no-registered-user@test.com",
+        )
+        self._create_org_user(user=user, organization=org)
+        self.client.force_login(manager)
+        app_label = User._meta.app_label
+        url = reverse(f"admin:{app_label}_user_changelist")
+        response = self.client.get(url)
+        self.assertContains(response, user.username)
 
     def test_admin_menu_groups(self):
         # Test menu group (openwisp-utils menu group) for RadiusAccounting, RadiusBatch,

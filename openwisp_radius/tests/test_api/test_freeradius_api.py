@@ -12,7 +12,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 from django.urls import reverse
 from django.utils.crypto import get_random_string
-from django.utils.timezone import now, timedelta
+from django.utils.timezone import now
 from freezegun import freeze_time
 
 from openwisp_utils.tests import capture_any_output, capture_stderr, catch_signal
@@ -153,10 +153,62 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
 
     @mock.patch("openwisp_users.settings.USER_PASSWORD_EXPIRATION", 30)
     def test_authorize_password_expired(self):
-        self._get_org_user()
-        User.objects.update(password_updated=now() - timedelta(days=60))
+        org_user = self._get_org_user()
+        self._backdate_password(org_user.user, 60)
         response = self._authorize_user(auth_header=self.auth_header)
         self.assertNotEqual(response.data, _AUTH_TYPE_ACCEPT_RESPONSE)
+        self.assertEqual(response.data, None)
+
+    @mock.patch("openwisp_users.settings.USER_PASSWORD_EXPIRATION", 30)
+    def test_authorize_password_expired_with_saml_login(self):
+        # A SAML (or any SSO) login must not resurrect an expired local
+        # password: the local password and the radius token are distinct
+        # credentials, each subject to its own expiration rule.
+        org_user = self._get_org_user()
+        user = org_user.user
+        RegisteredUser.objects.update_or_create(
+            user=user,
+            organization=self._get_org(),
+            defaults={"method": "saml", "is_verified": True},
+        )
+        self._backdate_password(user, 60)
+        radius_token = RadiusToken.objects.create(
+            user=user,
+            organization=self._get_org(),
+            can_auth=True,
+            password_based=False,
+        )
+        self.assertEqual(user.has_password_expired(), True)
+
+        with self.subTest("expired local password is rejected"):
+            response = self._authorize_user(auth_header=self.auth_header)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data, None)
+
+        with self.subTest("radius token issued after SSO login is accepted"):
+            response = self._authorize_user(
+                password=radius_token.key, auth_header=self.auth_header
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data, {"control:Auth-Type": "Accept"})
+
+    @mock.patch("openwisp_users.settings.USER_PASSWORD_EXPIRATION", 30)
+    def test_authorize_radius_token_after_password_login_expired(self):
+        # A radius token issued after a *local password* login must keep
+        # enforcing password expiration.
+        org_user = self._get_org_user()
+        user = org_user.user
+        self._backdate_password(user, 60)
+        radius_token = RadiusToken.objects.create(
+            user=user,
+            organization=self._get_org(),
+            can_auth=True,
+            password_based=True,
+        )
+        response = self._authorize_user(
+            password=radius_token.key, auth_header=self.auth_header
+        )
+        self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data, None)
 
     def test_authorize_failed(self):
@@ -172,7 +224,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             f"?uuid={str(self.default_org.pk)}",
         ]:
             with self.subTest(querystring):
-                post_url = f'{reverse("radius:authorize")}{querystring}'
+                post_url = f"{reverse('radius:authorize')}{querystring}"
                 response = self.client.post(
                     post_url, {"username": "tester", "password": "tester"}
                 )
@@ -205,6 +257,134 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = self._authorize_user(auth_header=self.auth_header)
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data)
+
+    def test_authorize_verified_user(self):
+        org_user = self._get_org_user()
+        user = org_user.user
+        org_settings = OrganizationRadiusSettings.objects.get(
+            organization=self._get_org()
+        )
+        org_settings.needs_identity_verification = True
+        org_settings.save()
+
+        with self.subTest("org-specific verified record passes authorization"):
+            RegisteredUser.objects.create(
+                user=user, organization=self._get_org(), is_verified=True
+            )
+            response = self._authorize_user(auth_header=self.auth_header)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data, {"control:Auth-Type": "Accept"})
+
+        with self.subTest("other-organization record does not pass authorization"):
+            RegisteredUser.objects.filter(user=user).delete()
+            org2 = self._create_org(name="verified-org-2", slug="verified-org-2")
+            self._create_org_user(organization=org2, user=user)
+            RegisteredUser.objects.create(
+                user=user, organization=org2, is_verified=True
+            )
+            response = self._authorize_user(auth_header=self.auth_header)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.data, None)
+
+    def test_multi_org_user_different_verification_states(self):
+        org1 = self._get_org()
+        org_settings = OrganizationRadiusSettings.objects.get(organization=org1)
+        org_settings.needs_identity_verification = True
+        org_settings.save()
+        org2 = self._create_org(name="org2", slug="org2")
+        org2_settings = OrganizationRadiusSettings.objects.get_or_create(
+            organization=org2
+        )[0]
+        org2_settings.needs_identity_verification = True
+        org2_settings.full_clean()
+        org2_settings.save()
+        user = self._get_user_with_org()
+        self._create_org_user(organization=org2, user=user)
+        RegisteredUser.objects.create(user=user, organization=org1, is_verified=True)
+        auth_header_org1 = f"Bearer {org1.pk} {org1.radius_settings.token}"
+        response = self._authorize_user(
+            username=user.username, auth_header=auth_header_org1
+        )
+        self.assertEqual(response.data["control:Auth-Type"], "Accept")
+
+        auth_header_org2 = f"Bearer {org2.pk} {org2.radius_settings.token}"
+        response = self._authorize_user(
+            username=user.username, auth_header=auth_header_org2
+        )
+        self.assertIsNone(response.data)
+
+    def test_other_org_record_is_not_used_as_fallback(self):
+        org1 = self._get_org()
+        org2 = self._create_org(name="org2", slug="org2")
+        org2_settings = OrganizationRadiusSettings.objects.get_or_create(
+            organization=org2
+        )[0]
+        org2_settings.needs_identity_verification = True
+        org2_settings.full_clean()
+        org2_settings.save()
+        user = self._get_user_with_org()
+        self._create_org_user(organization=org2, user=user)
+        RegisteredUser.objects.create(user=user, organization=org2, is_verified=True)
+        org_settings = OrganizationRadiusSettings.objects.get(organization=org1)
+        org_settings.needs_identity_verification = True
+        org_settings.save()
+
+        auth_header_org1 = f"Bearer {org1.pk} {org1.radius_settings.token}"
+        response = self._authorize_user(
+            username=user.username, auth_header=auth_header_org1
+        )
+        self.assertEqual(response.data, None)
+
+        auth_header_org2 = f"Bearer {org2.pk} {org2.radius_settings.token}"
+        response = self._authorize_user(
+            username=user.username, auth_header=auth_header_org2
+        )
+        self.assertEqual(response.data["control:Auth-Type"], "Accept")
+
+    def test_other_org_verified_with_org_unverified(self):
+        """
+        A user with a verified record in another org should not be
+        authorized for an org where they have an org-specific unverified record.
+        """
+        org = self._get_org()
+        org_settings = OrganizationRadiusSettings.objects.get(organization=org)
+        org_settings.needs_identity_verification = True
+        org_settings.save()
+        user = self._get_user_with_org()
+        org2 = self._create_org(name="org2-priority", slug="org2-priority")
+        self._create_org_user(organization=org2, user=user)
+        RegisteredUser.objects.create(user=user, organization=org, is_verified=False)
+        RegisteredUser.objects.create(user=user, organization=org2, is_verified=True)
+        auth_header = f"Bearer {org.pk} {org.radius_settings.token}"
+        response = self._authorize_user(username=user.username, auth_header=auth_header)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, None)
+
+    @mock.patch.object(registration, "AUTHORIZE_UNVERIFIED", ["mobile_phone"])
+    def test_other_org_special_method_with_org_unverified_not_authorized(self):
+        """
+        When AUTHORIZE_UNVERIFIED is set, the org-specific
+        record still takes precedence. A user with org-specific unverified record
+        using a non-special method should NOT be authorized even if they have a
+        verified record in another organization with a special method.
+        """
+        org = self._get_org()
+        org_settings = OrganizationRadiusSettings.objects.get(organization=org)
+        org_settings.needs_identity_verification = True
+        org_settings.save()
+        user = self._get_user_with_org()
+        org2 = self._create_org(name="org2-special", slug="org2-special")
+        self._create_org_user(organization=org2, user=user)
+        RegisteredUser.objects.create(
+            user=user, organization=org, method="email", is_verified=False
+        )
+        RegisteredUser.objects.create(
+            user=user, organization=org2, method="mobile_phone", is_verified=True
+        )
+        auth_header = f"Bearer {org.pk} {org.radius_settings.token}"
+        response = self._authorize_user(username=user.username, auth_header=auth_header)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, None)
 
     def test_authorize_radius_token_unverified_user(self):
         user = self._get_org_user()
@@ -258,7 +438,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
     def test_postauth_accept_201_querystring(self):
         self.assertEqual(RadiusPostAuth.objects.all().count(), 0)
         params = self._get_postauth_params()
-        post_url = f'{reverse("radius:postauth")}{self.token_querystring}'
+        post_url = f"{reverse('radius:postauth')}{self.token_querystring}"
         response = self.client.post(post_url, params)
         params["password"] = ""
         self.assertEqual(RadiusPostAuth.objects.filter(**params).count(), 1)
@@ -439,10 +619,10 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
     @capture_any_output()
     @mock.patch("openwisp_radius.receivers.send_login_email.delay")
     @mock.patch(
-        "openwisp_radius.api.serializers.RadiusAccountingSerializer.create",
+        "openwisp_radius.api.serializers.RadiusAccountingSerializer.save",
         side_effect=IntegrityError,
     )
-    def test_accounting_start_integrity_error(self, create, send_login_email):
+    def test_accounting_start_integrity_error(self, save, send_login_email):
         data = self.acct_post_data
         data["status_type"] = "Start"
         data = self._get_accounting_params(**data)
@@ -450,7 +630,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data)
         self.assertEqual(RadiusAccounting.objects.count(), 0)
-        create.assert_called_once()
+        save.assert_called_once()
         send_login_email.assert_not_called()
 
     @mock.patch(
@@ -578,7 +758,12 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
 
     @freeze_time(START_DATE)
     @capture_any_output()
-    def test_accounting_start_201(self):
+    @mock.patch(
+        "openwisp_radius.api.serializers.RadiusAccountingSerializer.to_representation",
+        side_effect=AssertionError,
+    )
+    @mock.patch("openwisp_radius.api.freeradius_views.radius_accounting_success.send")
+    def test_accounting_start_201(self, send, to_representation):
         self.assertEqual(RadiusAccounting.objects.count(), 0)
         data = self.acct_post_data
         data["status_type"] = "Start"
@@ -586,11 +771,18 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = self.post_json(data)
         self.assertEqual(response.status_code, 201)
         self.assertIsNone(response.data)
+        send.assert_called_once()
+        accounting_data = send.call_args.kwargs["accounting_data"]
+        self.assertNotIn("organization", accounting_data)
+        self.assertNotIn("status_type", accounting_data)
+        # Avoid serializing accounting data for an intentionally empty response.
+        to_representation.assert_not_called()
         self.assertEqual(RadiusAccounting.objects.count(), 1)
         self.assertAcctData(RadiusAccounting.objects.first(), data)
 
     @freeze_time(START_DATE)
-    def test_accounting_update_200(self):
+    @mock.patch("openwisp_radius.api.freeradius_views.radius_accounting_success.send")
+    def test_accounting_update_200(self, send):
         self.assertEqual(RadiusAccounting.objects.count(), 0)
         ra = self._create_radius_accounting(**self._acct_initial_data)
         data = self.acct_post_data
@@ -599,6 +791,10 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = self.post_json(data)
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data)
+        send.assert_called_once()
+        accounting_data = send.call_args.kwargs["accounting_data"]
+        self.assertNotIn("organization", accounting_data)
+        self.assertNotIn("status_type", accounting_data)
         self.assertEqual(RadiusAccounting.objects.count(), 1)
         ra.refresh_from_db()
         self.assertEqual(ra.update_time.timetuple(), now().timetuple())
@@ -1227,7 +1423,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertIsNone(response.data)
 
     def test_get_authorize_view(self):
-        url = f'{reverse("radius:authorize")}{self.token_querystring}'
+        url = f"{reverse('radius:authorize')}{self.token_querystring}"
         r = self.client.get(url, HTTP_ACCEPT="text/html")
         self.assertEqual(r.status_code, 405)
         expected = f'<form action="{reverse("radius:authorize")}'
@@ -1362,7 +1558,7 @@ class TestTransactionFreeradiusApi(
         )
         reply2.full_clean()
         reply2.save()
-        post_url = f'{reverse("radius:authorize")}{self.token_querystring}'
+        post_url = f"{reverse('radius:authorize')}{self.token_querystring}"
         response = self.client.post(
             post_url, {"username": "tester", "password": "tester"}
         )
@@ -1457,7 +1653,7 @@ class TestTransactionFreeradiusApi(
 
     def test_authorize_200_querystring(self):
         self._get_org_user()
-        post_url = f'{reverse("radius:authorize")}{self.token_querystring}'
+        post_url = f"{reverse('radius:authorize')}{self.token_querystring}"
         response = self.client.post(
             post_url, {"username": "tester", "password": "tester"}
         )
@@ -1694,7 +1890,10 @@ class TestTransactionFreeradiusApi(
     def test_authorize_unverified_user_with_special_method(self):
         org_user = self._get_org_user()
         reg_user = RegisteredUser(
-            user=org_user.user, method="mobile_phone", is_verified=False
+            user=org_user.user,
+            method="mobile_phone",
+            is_verified=False,
+            organization_id=org_user.organization_id,
         )
         reg_user.full_clean()
         reg_user.save()
@@ -2160,7 +2359,7 @@ class TestAutoGroupname(ApiTokenMixin, BaseTestCase):
         )
         user.radiususergroup_set.set([usergroup1, usergroup2])
         self.client.post(
-            f'{reverse("radius:accounting")}{self.token_querystring}',
+            f"{reverse('radius:accounting')}{self.token_querystring}",
             {
                 "status_type": "Start",
                 "session_time": "",
@@ -2199,7 +2398,7 @@ class TestAutoGroupname(ApiTokenMixin, BaseTestCase):
         )
         user.radiususergroup_set.set([usergroup1, usergroup2])
         self.client.post(
-            f'{reverse("radius:accounting")}{self.token_querystring}',
+            f"{reverse('radius:accounting')}{self.token_querystring}",
             {
                 "status_type": "Start",
                 "session_time": "",
@@ -2219,7 +2418,7 @@ class TestAutoGroupname(ApiTokenMixin, BaseTestCase):
     def test_mac_authentication_with_no_logging(self, logger):
         username = "5c:7d:c1:72:a7:3b"
         self.client.post(
-            f'{reverse("radius:accounting")}{self.token_querystring}',
+            f"{reverse('radius:accounting')}{self.token_querystring}",
             {
                 "status_type": "Start",
                 "session_time": "",
@@ -2254,7 +2453,7 @@ class TestAutoGroupnameDisabled(ApiTokenMixin, BaseTestCase):
             groupname="group2", priority=1, username="testgroup2"
         )
         user.radiususergroup_set.set([usergroup1, usergroup2])
-        url = f'{reverse("radius:accounting")}{self.token_querystring}'
+        url = f"{reverse('radius:accounting')}{self.token_querystring}"
         self.client.post(
             url,
             {
@@ -2319,12 +2518,15 @@ class TestClientIpApi(TestClientIpApiMixin, ApiTokenMixin, BaseTestCase):
             "Request rejected: (localhost) in organization settings or "
             "settings.py is not a valid IP address. Please contact administrator."
         )
-        with mock.patch(
-            "openwisp_radius.settings.FREERADIUS_ALLOWED_HOSTS", ["localhost"]
-        ), mock.patch.object(
-            OrganizationRadiusSettings._meta.get_field("freeradius_allowed_hosts"),
-            "from_db_value",
-            return_value="localhost",
+        with (
+            mock.patch(
+                "openwisp_radius.settings.FREERADIUS_ALLOWED_HOSTS", ["localhost"]
+            ),
+            mock.patch.object(
+                OrganizationRadiusSettings._meta.get_field("freeradius_allowed_hosts"),
+                "from_db_value",
+                return_value="localhost",
+            ),
         ):
             response = self.client.post(reverse("radius:authorize"), self.params)
         self.assertEqual(response.status_code, 403)
@@ -2442,7 +2644,7 @@ class TestOgranizationRadiusSettings(ApiTokenMixin, BaseTestCase):
         )
         self._get_org_user()
         token_querystring = f"?token={rad.token}&uuid={str(self.org.pk)}"
-        post_url = f'{reverse("radius:authorize")}{token_querystring}'
+        post_url = f"{reverse('radius:authorize')}{token_querystring}"
         # Clear cache before sending request
         cache.clear()
         self.client.post(post_url, {"username": "tester", "password": "tester"})
@@ -2465,7 +2667,7 @@ class TestOgranizationRadiusSettings(ApiTokenMixin, BaseTestCase):
     def test_no_org_radius_setting(self):
         self._get_org_user()
         token_querystring = f"?token=12345&uuid={str(self.org.pk)}"
-        post_url = f'{reverse("radius:authorize")}{token_querystring}'
+        post_url = f"{reverse('radius:authorize')}{token_querystring}"
         r = self.client.post(post_url, {"username": "tester", "password": "tester"})
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.data, {"detail": "Token authentication failed"})
@@ -2477,7 +2679,7 @@ class TestOgranizationRadiusSettings(ApiTokenMixin, BaseTestCase):
         cache.set("uuid", str(self.org.pk), 30)
         self._get_org_user()
         token_querystring = f"?token={rad.token}&uuid={str(self.org.pk)}"
-        post_url = f'{reverse("radius:authorize")}{token_querystring}'
+        post_url = f"{reverse('radius:authorize')}{token_querystring}"
         r = self.client.post(post_url, {"username": "tester", "password": "tester"})
         self.assertEqual(r.status_code, 200)
 

@@ -14,11 +14,13 @@ from django.utils import timezone
 from netaddr import EUI, mac_unix
 
 from openwisp_users.tests.utils import TestMultitenantAdminMixin
-from openwisp_utils.tests import capture_any_output, capture_stderr
+from openwisp_utils.tests import capture_any_output, capture_stderr, catch_signal
 
 from .. import settings as app_settings
 from ..counters.exceptions import MaxQuotaReached
+from ..exceptions import BatchProcessingError
 from ..radclient.client import RadClient
+from ..signals import radius_accounting_closed
 from ..tasks import perform_change_of_authorization
 from ..utils import (
     DEFAULT_SESSION_TIME_LIMIT,
@@ -42,6 +44,7 @@ RadiusUserGroup = load_model("RadiusUserGroup")
 RadiusBatch = load_model("RadiusBatch")
 OrganizationRadiusSettings = load_model("OrganizationRadiusSettings")
 Organization = swapper.load_model("openwisp_users", "Organization")
+RegisteredUser = load_model("RegisteredUser")
 
 
 class TestNas(BaseTestCase):
@@ -153,6 +156,113 @@ class TestRadiusAccounting(FileMixin, BaseTestCase):
             self.assertEqual(radiusaccounting1.terminate_cause, "Session-Timeout")
             self.assertEqual(radiusaccounting1.stop_time, radiusaccounting1.update_time)
             self.assertEqual(radiusaccounting2.stop_time, None)
+
+    def test_radius_accounting_closed_signal_on_commit(self):
+        radiusaccounting_options = _RADACCT.copy()
+        radiusaccounting_options.update(
+            {
+                "organization": self.default_org,
+                "nas_ip_address": "192.168.182.3",
+            }
+        )
+
+        def assert_signal_not_emitted_on_save(session, **save_kwargs):
+            with catch_signal(radius_accounting_closed) as handler:
+                with self.captureOnCommitCallbacks(execute=True):
+                    session.full_clean()
+                    session.save(**save_kwargs)
+                    handler.assert_not_called()
+                handler.assert_not_called()
+
+        def assert_signal_emitted_on_save(session, **save_kwargs):
+            with catch_signal(radius_accounting_closed) as handler:
+                with self.captureOnCommitCallbacks(execute=True):
+                    session.full_clean()
+                    session.save(**save_kwargs)
+                    handler.assert_not_called()
+                handler.assert_called_once()
+                self.assertEqual(handler.call_args.kwargs["sender"], RadiusAccounting)
+                self.assertEqual(handler.call_args.kwargs["instance"], session)
+
+        with self.subTest("Open session creation does not emit"):
+            session = RadiusAccounting(unique_id="closed-signal-1")
+            for key, value in radiusaccounting_options.items():
+                setattr(session, key, value)
+            assert_signal_not_emitted_on_save(session)
+
+        with self.subTest("Closed session creation emits on commit"):
+            session = RadiusAccounting(unique_id="closed-signal-2")
+            for key, value in radiusaccounting_options.items():
+                setattr(session, key, value)
+            session.stop_time = timezone.now()
+            assert_signal_emitted_on_save(session)
+
+        with self.subTest("Open session updated as closed emits on commit"):
+            session = self._create_radius_accounting(
+                unique_id="closed-signal-3", **radiusaccounting_options
+            )
+            session.stop_time = timezone.now()
+            assert_signal_emitted_on_save(session)
+
+        with self.subTest("Already closed session saved again does not emit"):
+            session = self._create_radius_accounting(
+                unique_id="closed-signal-4",
+                stop_time=timezone.now(),
+                **radiusaccounting_options,
+            )
+            assert_signal_not_emitted_on_save(session)
+
+        with self.subTest("Unsaved stop_time change does not emit"):
+            session = self._create_radius_accounting(
+                unique_id="closed-signal-5", **radiusaccounting_options
+            )
+            session.stop_time = timezone.now()
+            session.terminate_cause = "User-Request"
+            assert_signal_not_emitted_on_save(
+                session, update_fields=["terminate_cause"]
+            )
+            self.assertIsNone(session._initial_stop_time)
+            assert_signal_emitted_on_save(session, update_fields=["stop_time"])
+
+    def test_close_stale_sessions_on_nas_boot_query_count(self):
+        radiusaccounting_options = _RADACCT.copy()
+        radiusaccounting_options.update(
+            {
+                "organization": self.default_org,
+                "nas_ip_address": "192.168.182.3",
+                "called_station_id": "AA-BB-CC-DD-EE-FF",
+            }
+        )
+        session_options = radiusaccounting_options.copy()
+        session_options.update(
+            unique_id="nas-reboot-query-count-1",
+            username="nas-reboot-query-count-1",
+        )
+        self._create_radius_accounting(**session_options)
+        session_options = radiusaccounting_options.copy()
+        session_options.update(
+            unique_id="nas-reboot-query-count-2",
+            username="nas-reboot-query-count-2",
+        )
+        self._create_radius_accounting(**session_options)
+        with self.assertNumQueries(4):
+            closed_count = RadiusAccounting._close_stale_sessions_on_nas_boot(
+                called_station_id=radiusaccounting_options["called_station_id"]
+            )
+        self.assertEqual(closed_count, 2)
+
+    def test_save_update_fields_persists_backfilled_start_time(self):
+        options = _RADACCT.copy()
+        session = self._create_radius_accounting(
+            unique_id="start-time-update-fields", **options
+        )
+        RadiusAccounting.objects.filter(pk=session.pk).update(start_time=None)
+        session.refresh_from_db()
+        session.terminate_cause = "User-Request"
+        session.save(update_fields=["terminate_cause"])
+        session.refresh_from_db()
+        self.assertIsNotNone(session.start_time)
+        self.assertEqual(session.terminate_cause, "User-Request")
 
     @capture_any_output()
     @mock.patch.object(app_settings, "OPENVPN_DATETIME_FORMAT", "%Y-%m-%d %H:%M:%S")
@@ -750,6 +860,17 @@ class TestRadiusBatch(BaseTestCase):
     def test_clean_method(self):
         with self.assertRaises(ValidationError):
             self._create_radius_batch()
+        with self.assertRaises(ValidationError) as context_manager:
+            self._create_radius_batch(
+                strategy="prefix",
+                prefix="test-prefix16",
+                name="test-past-expiration",
+                expiration_date=timezone.localdate() - timezone.timedelta(days=1),
+            )
+        self.assertEqual(
+            context_manager.exception.message_dict["expiration_date"],
+            ["Expiration date cannot be in the past."],
+        )
         # missing csvfile
         try:
             self._create_radius_batch(strategy="csv", name="test")
@@ -777,6 +898,100 @@ class TestRadiusBatch(BaseTestCase):
         else:
             os.remove(dummy_file)
             self.fail("ValidationError not raised")
+
+    def test_clean_method_rejects_group_from_different_organization(self):
+        group = self._create_radius_group(name="guests")
+        organization = self._create_org(name="other organization", slug="other-org")
+        with self.assertRaises(ValidationError) as context_manager:
+            self._create_radius_batch(
+                organization=organization,
+                name="test",
+                strategy="prefix",
+                prefix="test-prefix",
+                group=group,
+            )
+        self.assertIn("group", context_manager.exception.message_dict)
+
+    def test_save_user_rejects_group_from_different_organization(self):
+        user = self._get_user()
+        self._create_org_user(user=user)
+        existing_group = self._create_radius_group(name="existing")
+        self._create_radius_usergroup(user=user, group=existing_group)
+        organization = self._create_org(name="other organization", slug="other-org")
+        batch = self._create_radius_batch(
+            name="test", strategy="prefix", prefix="test-prefix"
+        )
+        batch.group = self._create_radius_group(
+            name="guests", organization=organization
+        )
+        with self.assertRaises(ValidationError) as context_manager:
+            batch.save_user(user)
+        self.assertIn("group", context_manager.exception.message_dict)
+        self.assertTrue(
+            RadiusUserGroup.objects.filter(user=user, group=existing_group).exists()
+        )
+        self.assertFalse(
+            RadiusUserGroup.objects.filter(user=user, group=batch.group).exists()
+        )
+
+    def test_clean_method_allows_unchanged_past_expiration_date(self):
+        expiration_date = timezone.localdate() - timezone.timedelta(days=1)
+        radiusbatch = RadiusBatch.objects.create(
+            organization=self.default_org,
+            name="test-legacy-expiration",
+            strategy="prefix",
+            prefix="test-legacy-exp",
+            expiration_date=expiration_date,
+        )
+
+        radiusbatch.name = "test-legacy-expiration-updated"
+        radiusbatch.full_clean()
+
+    def test_start_processing_claims_pending_batch(self):
+        batch = self._create_radius_batch(
+            name="test", strategy="prefix", prefix="test-prefix"
+        )
+        self.assertTrue(batch.start_processing())
+        batch.refresh_from_db()
+        self.assertEqual(batch.status, RadiusBatch.PROCESSING)
+        self.assertFalse(batch.start_processing())
+
+    @mock.patch(
+        "openwisp_radius.base.models.get_channel_layer",
+        side_effect=RuntimeError("channel layer is unavailable"),
+    )
+    def test_process_does_not_claim_batch_if_channel_layer_initialization_fails(
+        self, _get_channel_layer
+    ):
+        batch = self._create_radius_batch(
+            name="test", strategy="prefix", prefix="test-prefix"
+        )
+        with self.assertRaisesRegex(RuntimeError, "channel layer is unavailable"):
+            batch.process()
+        batch.refresh_from_db()
+        self.assertEqual(batch.status, RadiusBatch.PENDING)
+
+    def test_delete_if_not_processing_rechecks_status(self):
+        batch = self._create_radius_batch(
+            name="test", strategy="prefix", prefix="test-prefix"
+        )
+        stale_batch = RadiusBatch.objects.get(pk=batch.pk)
+        batch.status = RadiusBatch.PROCESSING
+        batch.save(update_fields=["status"])
+        with self.assertRaises(BatchProcessingError):
+            stale_batch.delete_if_not_processing()
+        self.assertTrue(RadiusBatch.objects.filter(pk=batch.pk).exists())
+
+    def test_delete_if_not_processing_rechecks_organization(self):
+        batch = self._create_radius_batch(
+            name="test", strategy="prefix", prefix="test-prefix"
+        )
+        stale_batch = RadiusBatch.objects.get(pk=batch.pk)
+        batch.organization = self._create_org(name="other", slug="other")
+        batch.save(update_fields=["organization"])
+        with self.assertRaises(RadiusBatch.DoesNotExist):
+            stale_batch.delete_if_not_processing()
+        self.assertTrue(RadiusBatch.objects.filter(pk=batch.pk).exists())
 
 
 class TestPrivateCsvFile(FileMixin, TestMultitenantAdminMixin, BaseTestCase):
@@ -1216,6 +1431,63 @@ class TestChangeOfAuthorization(BaseTransactionTestCase):
         self.assertEqual(org1_session.groupname, org1_power_user_group.name)
         org2_session.refresh_from_db()
         self.assertEqual(org2_session.groupname, f"{org2.slug}-users")
+
+
+class TestRegisteredUser(BaseTestCase):
+    def test_get_for_user_and_org(self):
+        user = self._create_user()
+        org1 = self._create_org(name="ru-test-org-1", slug="ru-test-org-1")
+        org2 = self._create_org(name="ru-test-org-2", slug="ru-test-org-2")
+
+        with self.subTest("returns None when no records exist"):
+            result = RegisteredUser.get_for_user_and_org(user, org1)
+            self.assertEqual(result, None)
+
+        with self.subTest("returns only the requested organization record"):
+            org2_ru = RegisteredUser.objects.create(
+                user=user, organization=org2, is_verified=True
+            )
+            result = RegisteredUser.get_for_user_and_org(user, org1)
+            self.assertEqual(result, None)
+            result = RegisteredUser.get_for_user_and_org(user, org2)
+            self.assertEqual(result, org2_ru)
+            self.assertEqual(result.is_verified, True)
+
+        with self.subTest("uses prefetched registered_users without extra queries"):
+            org1_ru = RegisteredUser.objects.create(
+                user=user,
+                organization=org1,
+                is_verified=False,
+            )
+            prefetched_user = (
+                get_user_model()
+                .objects.prefetch_related("registered_users")
+                .get(pk=user.pk)
+            )
+            with self.assertNumQueries(0):
+                result = RegisteredUser.get_for_user_and_org(prefetched_user, org1)
+            self.assertEqual(result, org1_ru)
+
+    def test_clean_requires_unique_org_specific_registered_user(self):
+        user = self._create_user()
+        org = self._create_org(name="dup-test-org", slug="dup-test-org")
+        other_org = self._create_org(name="dup-test-org-2", slug="dup-test-org-2")
+
+        with self.subTest("duplicate org-specific raises ValidationError"):
+            RegisteredUser.objects.create(user=user, organization=org)
+            duplicate = RegisteredUser(user=user, organization=org)
+            with self.assertRaises(ValidationError):
+                duplicate.full_clean()
+
+        with self.subTest("different organizations are allowed"):
+            record = RegisteredUser(user=user, organization=other_org)
+            record.full_clean()
+
+    def test_clean_requires_organization(self):
+        user = self._create_user()
+
+        with self.assertRaises(ValidationError):
+            RegisteredUser(user=user).full_clean()
 
 
 del BaseTestCase

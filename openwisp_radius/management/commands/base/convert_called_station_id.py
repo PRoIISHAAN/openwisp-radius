@@ -4,8 +4,8 @@ from uuid import UUID
 
 import openvpn_status
 from django.core.management import BaseCommand
-from Exscript.protocols import telnetlib
 from netaddr import EUI, mac_unix
+from telnetlib3 import telnetlib
 
 from .... import settings as app_settings
 from ....utils import load_model
@@ -23,7 +23,8 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
     help = "Correct Called Station IDs of Radius Sessions"
 
     def _get_raw_management_info(self, host, port, password):
-        with telnetlib.Telnet(host, port, timeout=TELNET_CONNECTION_TIMEOUT) as tn:
+        tn = telnetlib.Telnet(host, port, timeout=TELNET_CONNECTION_TIMEOUT)
+        try:
             if password:
                 tn.read_until(b"ENTER PASSWORD:", timeout=TELNET_CONNECTION_TIMEOUT)
                 tn.write(password.encode("ascii") + b"\n")
@@ -36,6 +37,8 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
             raw_management_info = tn.read_until(
                 b"END", timeout=TELNET_CONNECTION_TIMEOUT
             )
+        finally:
+            tn.close()
         return raw_management_info
 
     def _get_openvpn_routing_info(self, host, port=7505, password=None):

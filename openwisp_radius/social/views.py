@@ -1,10 +1,12 @@
 import swapper
-from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
+from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.http import HttpResponse, HttpResponseRedirect
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy as _
 from django.views import View
-from rest_framework.authtoken.models import Token
+
+from openwisp_users.auth import create_auth_token, is_password_based_user
 
 from ..api.views import RadiusTokenMixin
 from ..utils import get_organization_radius_settings, load_model
@@ -42,18 +44,22 @@ class RedirectCaptivePageView(RadiusTokenMixin, View):
         user = request.user
         is_member = user.is_member(org)
         # add user to organization
-        if not is_member:
-            orgUser = OrganizationUser(organization=org, user=user)
-            orgUser.full_clean()
-            orgUser.save()
-        try:
-            user.registered_user
-        except ObjectDoesNotExist:
-            registered_user = RegisteredUser(
-                user=user, method="social_login", is_verified=False
+        with transaction.atomic():
+            if not is_member:
+                orgUser = OrganizationUser(organization=org, user=user)
+                orgUser.full_clean()
+                orgUser.save()
+            registered_user, created = RegisteredUser.get_or_create_for_user_and_org(
+                user=user,
+                organization=org,
+                defaults={"method": "social_login", "is_verified": False},
             )
-            registered_user.full_clean()
-            registered_user.save()
+            if not created:
+                if registered_user.method == "pending_verification":
+                    registered_user.method = "social_login"
+                    registered_user.is_verified = False
+                    registered_user.full_clean()
+                    registered_user.save()
 
     def get_redirect_url(self, request, organization):
         """
@@ -61,9 +67,10 @@ class RedirectCaptivePageView(RadiusTokenMixin, View):
         """
         cp = request.GET.get("cp")
         user = request.user
-        Token.objects.filter(user=user).delete()
-        token, _ = Token.objects.get_or_create(user=user)
-        rad_token = self.get_or_create_radius_token(user, organization)
+        token = create_auth_token(request, user, renew=True)
+        rad_token = self.get_or_create_radius_token(
+            user, organization, password_based=is_password_based_user(user)
+        )
         return (
             f"{cp}?username={user.username}&token={token.key}&"
             f"radius_user_token={rad_token.key}"

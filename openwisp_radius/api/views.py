@@ -1,18 +1,15 @@
 import logging
 
 import swapper
-from allauth.account.forms import default_token_generator
-from allauth.account.utils import url_str_to_user_pk, user_pk_to_url_str
+from allauth.account.utils import user_pk_to_url_str
 from dj_rest_auth import app_settings as rest_auth_settings
 from dj_rest_auth.registration.views import RegisterView as BaseRegisterView
-from dj_rest_auth.views import PasswordResetConfirmView as BasePasswordResetConfirmView
-from dj_rest_auth.views import PasswordResetView as BasePasswordResetView
 from django.contrib.auth import get_user_model
 from django.contrib.sites.shortcuts import get_current_site
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
 from django.db.models import Q
-from django.db.utils import IntegrityError
 from django.http import Http404, HttpResponse
 from django.utils import timezone
 from django.utils.decorators import method_decorator
@@ -26,7 +23,7 @@ from rest_framework import serializers, status
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.authtoken.models import Token as UserToken
 from rest_framework.authtoken.views import ObtainAuthToken as BaseObtainAuthToken
-from rest_framework.exceptions import NotFound, ParseError, PermissionDenied
+from rest_framework.exceptions import APIException, NotFound, PermissionDenied
 from rest_framework.filters import SearchFilter
 from rest_framework.generics import (
     CreateAPIView,
@@ -34,16 +31,17 @@ from rest_framework.generics import (
     ListAPIView,
     ListCreateAPIView,
     RetrieveAPIView,
+    RetrieveDestroyAPIView,
     RetrieveUpdateDestroyAPIView,
+    get_object_or_404,
 )
-from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import (
-    DjangoModelPermissions,
-    IsAdminUser,
-    IsAuthenticated,
-)
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.throttling import BaseThrottle  # get_ident method
+from rest_framework.settings import api_settings as drf_api_settings
+from rest_framework.throttling import (  # get_ident method
+    BaseThrottle,
+    ScopedRateThrottle,
+)
 
 from openwisp_radius.api.serializers import RadiusUserSerializer
 from openwisp_users.api.authentication import BearerAuthentication, SesameAuthentication
@@ -53,12 +51,19 @@ from openwisp_users.api.mixins import (
     FilterByParentManaged,
     ProtectedAPIMixin,
 )
-from openwisp_users.api.permissions import IsOrganizationManager
+from openwisp_users.api.permissions import DjangoModelPermissions, IsOrganizationManager
 from openwisp_users.api.views import ChangePasswordView as BasePasswordChangeView
+from openwisp_users.api.views import (
+    PasswordResetConfirmView as BasePasswordResetConfirmView,
+)
+from openwisp_users.api.views import PasswordResetView as BasePasswordResetView
+from openwisp_users.auth import create_auth_token, is_password_based_user
 from openwisp_users.backends import UsersAuthenticationBackend
+from openwisp_utils.api.pagination import OpenWispPagination
 
 from .. import settings as app_settings
 from ..exceptions import (
+    BatchProcessingError,
     PhoneTokenException,
     SmsAttemptCooldownException,
     UserAlreadyVerified,
@@ -69,15 +74,23 @@ from .freeradius_views import AccountingFilter, AccountingViewPagination
 from .permissions import IsRegistrationEnabled, IsSmsVerificationEnabled
 from .serializers import (
     AuthTokenSerializer,
+    BatchUserSerializer,
     ChangePhoneNumberSerializer,
     RadiusAccountingSerializer,
+    RadiusBatchReadSerializer,
     RadiusBatchSerializer,
     RadiusGroupSerializer,
     RadiusUserGroupSerializer,
+    UpdateRegisteredUserMethodSerializer,
     UserRadiusUsageSerializer,
     ValidatePhoneTokenSerializer,
 )
-from .swagger import ObtainTokenRequest, ObtainTokenResponse, RegisterResponse
+from .swagger import (
+    BatchDetailResponse,
+    ObtainTokenRequest,
+    ObtainTokenResponse,
+    RegisterResponse,
+)
 from .utils import ErrorDictMixin, IDVerificationHelper
 
 authorize = freeradius_views.authorize
@@ -88,10 +101,17 @@ _TOKEN_AUTH_FAILED = _("Token authentication failed")
 renew_required = app_settings.DISPOSABLE_RADIUS_USER_TOKEN
 logger = logging.getLogger(__name__)
 
+# Keep password-reset endpoints protected by the "others" scope without
+# dropping global DRF throttles.
+PASSWORD_RESET_THROTTLE_CLASSES = tuple(
+    dict.fromkeys((*drf_api_settings.DEFAULT_THROTTLE_CLASSES, ScopedRateThrottle))
+)
+
 User = get_user_model()
 Organization = swapper.load_model("openwisp_users", "Organization")
 OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
 PhoneToken = load_model("PhoneToken")
+RegisteredUser = load_model("RegisteredUser")
 RadiusAccounting = load_model("RadiusAccounting")
 RadiusToken = load_model("RadiusToken")
 RadiusBatch = load_model("RadiusBatch")
@@ -105,26 +125,57 @@ class ThrottledAPIMixin(object):
     throttle_scope = "others"
 
 
-class BatchView(ThrottledAPIMixin, CreateAPIView):
-    authentication_classes = (BearerAuthentication, SessionAuthentication)
-    permission_classes = (IsAdminUser, DjangoModelPermissions)
-    queryset = RadiusBatch.objects.all()
-    serializer_class = RadiusBatchSerializer
+class RadiusBatchFilter(OrganizationManagedFilter, filters.FilterSet):
+    class Meta(OrganizationManagedFilter.Meta):
+        model = RadiusBatch
+        fields = [*OrganizationManagedFilter.Meta.fields, "strategy"]
 
-    def post(self, request, *args, **kwargs):
-        """
+
+@method_decorator(
+    name="get",
+    decorator=swagger_auto_schema(
+        operation_description="""
+        Returns a list of batch user creation operations for the
+        organizations managed by the user.
+        """,
+    ),
+)
+@method_decorator(
+    name="post",
+    decorator=swagger_auto_schema(
+        operation_description="""
         **Requires the user auth token (Bearer Token).**
         Allows organization administrators to create
         a batch of users using a csv file or generate users
         with a given prefix.
-        """
+        """,
+        request_body=RadiusBatchSerializer,
+        responses={201: RadiusBatchSerializer, 202: RadiusBatchSerializer},
+    ),
+)
+class BatchView(ThrottledAPIMixin, FilterByOrganizationManaged, ListCreateAPIView):
+    authentication_classes = (BearerAuthentication, SessionAuthentication)
+    permission_classes = (IsAdminUser, DjangoModelPermissions)
+    queryset = RadiusBatch.objects.select_related("organization").order_by("-created")
+    serializer_class = RadiusBatchSerializer
+    read_serializer_class = RadiusBatchReadSerializer
+    filterset_class = RadiusBatchFilter
+    filter_backends = [DjangoFilterBackend, SearchFilter]
+    search_fields = ["name"]
+    pagination_class = OpenWispPagination
+    pagination_page_size = 20
+
+    def get_serializer_class(self):
+        if self.request.method == "GET":
+            return self.read_serializer_class
+        return super().get_serializer_class()
+
+    def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         if serializer.is_valid():
             valid_data = serializer.validated_data.copy()
             num_of_users = valid_data.get("number_of_users", 0)
-            organization = valid_data.pop("organization_slug", None)
-            valid_data.pop("number_of_users", None)
-            batch = serializer.save(organization=organization)
+            batch = serializer.save()
             is_async = batch.schedule_processing(number_of_users=num_of_users)
             batch.refresh_from_db()
             response_serializer = self.get_serializer(batch)
@@ -159,7 +210,11 @@ class DispatchOrgMixin(object):
 
 class DownloadRadiusBatchPdfView(ThrottledAPIMixin, DispatchOrgMixin, RetrieveAPIView):
     authentication_classes = (BearerAuthentication, SessionAuthentication)
-    permission_classes = (IsOrganizationManager, IsAdminUser, DjangoModelPermissions)
+    permission_classes = (
+        IsOrganizationManager,
+        IsAdminUser,
+        DjangoModelPermissions,
+    )
     queryset = RadiusBatch.objects.all()
 
     @swagger_auto_schema(responses={200: "(File Byte Stream)"})
@@ -179,6 +234,72 @@ class DownloadRadiusBatchPdfView(ThrottledAPIMixin, DispatchOrgMixin, RetrieveAP
 
 
 download_rad_batch_pdf = DownloadRadiusBatchPdfView.as_view()
+
+
+class Conflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = _("Conflict.")
+    default_code = "conflict"
+
+
+@method_decorator(
+    name="get",
+    decorator=swagger_auto_schema(
+        operation_description="""
+        Returns a batch user creation operation by its UUID.
+        """,
+        responses={200: BatchDetailResponse},
+    ),
+)
+@method_decorator(
+    name="delete",
+    decorator=swagger_auto_schema(
+        operation_description="""
+        Deletes a batch user creation operation and its associated users.
+        Cannot delete a batch while it is being processed.
+        """,
+        responses={204: "No Content", 409: "Conflict"},
+    ),
+)
+class BatchDetailView(
+    ProtectedAPIMixin, FilterByOrganizationManaged, RetrieveDestroyAPIView
+):
+    authentication_classes = (BearerAuthentication, SessionAuthentication)
+    permission_classes = (IsAdminUser, DjangoModelPermissions)
+    queryset = RadiusBatch.objects.select_related("organization")
+    serializer_class = RadiusBatchReadSerializer
+    pagination_class = OpenWispPagination
+    pagination_page_size = 100
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        data = self.get_serializer(instance).data
+        page = self.paginate_queryset(instance.users.order_by("pk"))
+        users = self.get_paginated_response(
+            BatchUserSerializer(page, many=True).data
+        ).data
+        created = data.pop("created")
+        modified = data.pop("modified")
+        data["users"] = users
+        data["created"] = created
+        data["modified"] = modified
+        return Response(data)
+
+    def perform_destroy(self, instance):
+        try:
+            instance.delete_if_not_processing()
+        except BatchProcessingError:
+            raise Conflict(
+                _(
+                    "The radius batch object is currently being processed"
+                    " and cannot be deleted."
+                )
+            )
+        except RadiusBatch.DoesNotExist:
+            raise NotFound()
+
+
+batch_detail = BatchDetailView.as_view()
 
 
 class UserDetailsUpdaterMixin(object):
@@ -230,7 +351,7 @@ class RadiusTokenMixin(object):
             used_radtoken.delete()
 
     def get_or_create_radius_token(
-        self, user, organization, enable_auth=True, renew=True
+        self, user, organization, enable_auth=True, renew=True, password_based=None
     ):
         if renew:
             self._delete_used_token(user, organization)
@@ -243,6 +364,7 @@ class RadiusTokenMixin(object):
             self._radius_accounting_nas_stop(user, radius_token.organization)
             radius_token.organization = organization
         radius_token.can_auth = enable_auth
+        radius_token.password_based = password_based
         radius_token.full_clean()
         radius_token.save()
         # Create a cache for 24 hours so that next
@@ -310,18 +432,23 @@ class ObtainAuthTokenView(
             )
             serializer.is_valid(raise_exception=True)
             user = self.get_user(serializer, *args, **kwargs)
-        token, _ = UserToken.objects.get_or_create(user=user)
-        self.get_or_create_radius_token(user, self.organization, renew=renew_required)
+        token = create_auth_token(request, user)
+        self.get_or_create_radius_token(
+            user,
+            self.organization,
+            renew=renew_required,
+            password_based=is_password_based_user(user),
+        )
         self.update_user_details(user)
         context = {"view": self, "request": request}
         serializer = self.serializer_class(instance=token, context=context)
-        response = RadiusUserSerializer(user).data
+        response = RadiusUserSerializer(user, context=context).data
         response.update(serializer.data)
         status_code = 200 if user.is_active else 401
         # If identity verification is required, check if user is verified
         if self._needs_identity_verification(
             {"slug": kwargs["slug"]}
-        ) and not self.is_identity_verified_strong(user):
+        ) and not self.is_identity_verified_strong(user, self.organization):
             status_code = 401
         return Response(response, status=status_code)
 
@@ -335,24 +462,23 @@ class ObtainAuthTokenView(
             if get_organization_radius_settings(
                 self.organization, "registration_enabled"
             ):
-                if self._needs_identity_verification(
-                    org=self.organization
-                ) and not self.is_identity_verified_strong(user):
-                    raise PermissionDenied
                 try:
-                    org_user = OrganizationUser(
-                        user=user, organization=self.organization
-                    )
-                    org_user.full_clean()
-                    org_user.save()
+                    with transaction.atomic():
+                        OrganizationUser.objects.get_or_create(
+                            user=user, organization=self.organization
+                        )
+                        RegisteredUser.get_or_create_for_user_and_org(
+                            user=user,
+                            organization=self.organization,
+                            defaults={"method": "pending_verification"},
+                        )
                 except ValidationError as error:
                     raise serializers.ValidationError(
                         {"non_field_errors": error.message_dict.pop("__all__")}
                     )
             else:
                 message = _(
-                    "{organization} does not allow self registration "
-                    "of new accounts."
+                    "{organization} does not allow self registration of new accounts."
                 ).format(organization=self.organization.name)
                 raise PermissionDenied(message)
 
@@ -383,19 +509,28 @@ class ValidateAuthTokenView(
         response = {"response_code": "BLANK_OR_INVALID_TOKEN"}
         if request_token:
             try:
-                token = UserToken.objects.select_related(
-                    "user", "user__registered_user"
-                ).get(key=request_token)
+                token = (
+                    UserToken.objects.select_related(
+                        "user",
+                    )
+                    .prefetch_related(
+                        "user__registered_users",
+                    )
+                    .get(key=request_token)
+                )
             except UserToken.DoesNotExist:
                 pass
             else:
                 user = token.user
                 self.get_or_create_radius_token(
-                    user, self.organization, renew=renew_required
+                    user,
+                    self.organization,
+                    renew=renew_required,
+                    password_based=is_password_based_user(user),
                 )
                 # user may be in the process of changing the phone number
                 # in that case show the new phone number (which is not verified yet)
-                if not self.is_identity_verified_strong(user):
+                if not self.is_identity_verified_strong(user, self.organization):
                     phone_token = (
                         PhoneToken.objects.filter(user=user)
                         .order_by("-created")
@@ -404,8 +539,8 @@ class ValidateAuthTokenView(
                     user.phone_number = (
                         phone_token.phone_number if phone_token else user.phone_number
                     )
-                response = RadiusUserSerializer(user).data
                 context = {"view": self, "request": request}
+                response = RadiusUserSerializer(user, context=context).data
                 token_data = rest_auth_settings.api_settings.TOKEN_SERIALIZER(
                     token, context=context
                 ).data
@@ -512,12 +647,13 @@ password_change = PasswordChangeView.as_view()
 
 class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetView):
     authentication_classes = tuple()
+    throttle_classes = PASSWORD_RESET_THROTTLE_CLASSES
 
     @swagger_auto_schema(
         responses={
             200: '`{"detail": "Password reset e-mail has been sent."}`',
-            400: '`{"detail": "The input field is required."}`',
-            404: '`{"detail": "Not found."}`',
+            400: '`{"input": ["This field is required."]}`',
+            404: '`{"detail": "No Organization matches the given query."}`',
         }
     )
     def post(self, request, *args, **kwargs):
@@ -527,45 +663,65 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
         The input field can be an email, an username or
         a phone number (if mobile phone verification is in use).
         """
-        request.user = self.get_user(request)
         return super().post(request, *args, **kwargs)
 
-    def get_serializer_context(self):
-        user = self.request.user
-        if not user.pk:
-            return
-        uid = user_pk_to_url_str(user)
-        token = default_token_generator.make_token(user)
-        password_reset_urls = app_settings.PASSWORD_RESET_URLS
-        password_reset_url = app_settings.DEFAULT_PASSWORD_RESET_URL
-        domain = get_current_site(self.request).domain
-        if getattr(self, "swagger_fake_view", False):
-            organization_pk, organization_slug = None, None  # pragma: no cover
-        else:
-            organization_pk = self.organization.pk
-            organization_slug = self.organization.slug
-            org_radius_settings = self.organization.radius_settings
-            if org_radius_settings.password_reset_url:
-                password_reset_url = org_radius_settings.password_reset_url
-            else:
-                password_reset_url = password_reset_urls.get(
-                    str(organization_pk), password_reset_url
-                )
-        password_reset_url = password_reset_url.format(
-            organization=organization_slug, uid=uid, token=token, site=domain
-        )
-        context = {"request": self.request, "password_reset_url": password_reset_url}
-        return context
+    def get_users(self, identifier):
+        """
+        Return active users matching ``identifier`` who belong to this organization.
 
-    def get_user(self, request):
-        if request.data.get("input", None):
-            input = request.data["input"]
-            user = auth_backend.get_users(input).first()
-            if user is None:
-                raise Http404("No user was found with given details.")
-            self.validate_membership(user)
-            return user
-        raise ParseError(_("The email field is required."))
+        Superusers are always included, regardless of organization membership,
+        consistent with ``DispatchOrgMixin.validate_membership()``. Always
+        returns a queryset and never reveals whether ``identifier`` exists
+        outside this organization. Both an unknown identifier and a user who is
+        not a member of this organization (and not a superuser) produce an
+        empty queryset, allowing the password reset endpoint to return the same
+        success response in all cases and preventing user enumeration.
+        """
+        app_label = User._meta.app_config.label
+        return (
+            auth_backend.get_users(identifier)
+            .filter(is_active=True)
+            .filter(
+                Q(is_superuser=True)
+                | Q(
+                    **{
+                        f"{app_label}_organizationuser__organization": (
+                            self.organization
+                        ),
+                        f"{app_label}_organizationuser__organization__is_active": (
+                            True
+                        ),
+                    }
+                )
+            )
+            .distinct()
+        )
+
+    def get_password_reset_url(self, user, token):
+        uid = user_pk_to_url_str(user)
+        password_reset_urls = app_settings.PASSWORD_RESET_URLS
+        password_reset_url_template = app_settings.DEFAULT_PASSWORD_RESET_URL
+        org_radius_settings = self.organization.radius_settings
+        # password_reset_url is a FallbackCharField, so it always resolves to
+        # DEFAULT_PASSWORD_RESET_URL. Only a value different from the default
+        # indicates an organization-specific override; otherwise fall back to
+        # OPENWISP_RADIUS_PASSWORD_RESET_URLS.
+        if (
+            org_radius_settings.password_reset_url
+            and org_radius_settings.password_reset_url
+            != app_settings.DEFAULT_PASSWORD_RESET_URL
+        ):
+            password_reset_url_template = org_radius_settings.password_reset_url
+        else:
+            password_reset_url_template = password_reset_urls.get(
+                str(self.organization.pk), password_reset_url_template
+            )
+        return password_reset_url_template.format(
+            organization=self.organization.slug,
+            uid=uid,
+            token=token,
+            site=get_current_site(self.request).domain,
+        )
 
 
 password_reset = PasswordResetView.as_view()
@@ -575,6 +731,7 @@ class PasswordResetConfirmView(
     ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetConfirmView
 ):
     authentication_classes = tuple()
+    throttle_classes = PASSWORD_RESET_THROTTLE_CLASSES
 
     @swagger_auto_schema(
         responses={
@@ -586,18 +743,10 @@ class PasswordResetConfirmView(
         Allows users to confirm their reset password after having
         it requested via the `Reset password` endpoint.
         """
-        self.validate_user()
         return super().post(request, *args, **kwargs)
 
-    def validate_user(self, *args, **kwargs):
-        if self.request.POST.get("uid", None):
-            try:
-                uid = url_str_to_user_pk(self.request.POST["uid"])
-                user = User.objects.get(pk=uid)
-            except (User.DoesNotExist, ValidationError):
-                raise Http404()
-            self.validate_membership(user)
-            return user
+    def validate_user(self, user):
+        self.validate_membership(user)
 
 
 password_reset_confirm = PasswordResetConfirmView.as_view()
@@ -612,6 +761,14 @@ class CreatePhoneTokenView(
         IsSmsVerificationEnabled,
         IsAuthenticated,
     )
+
+    def get_ident(self, request):
+        """Override DRF's client-ID lookup for the SMS token IP quota.
+
+        X-Forwarded-For is caller-controlled and could bypass the quota.
+        Reverse proxies must replace REMOTE_ADDR with the client address.
+        """
+        return request.META.get("REMOTE_ADDR")
 
     @swagger_auto_schema(
         operation_description=("""
@@ -629,29 +786,38 @@ class CreatePhoneTokenView(
     def create(self, *args, **kwargs):
         request = self.request
         self.validate_membership(request.user)
-        phone_number = request.data.get("phone_number", request.user.phone_number)
+        # only the change phone number endpoint can change the phone number
+        phone_number = kwargs.pop("phone_number", request.user.phone_number)
         phone_token = PhoneToken(
             user=request.user,
+            organization=self.organization,
             ip=self.get_ident(request),
             phone_number=phone_number,
         )
+        org_cooldown = self.organization.radius_settings.sms_cooldown
         try:
-            phone_token.full_clean()
-            if kwargs.get("enforce_unverified", True):
-                phone_token._validate_already_verified()
+            with transaction.atomic():
+                # acquire lock on the user to prevent bypassing
+                # cooldown period with concurrent requests
+                phone_token.user = (
+                    get_user_model().objects.select_for_update().get(pk=request.user.pk)
+                )
+                phone_token.full_clean()
+                if kwargs.get("enforce_unverified", True):
+                    phone_token._validate_already_verified(
+                        organization=self.organization
+                    )
+                self.enforce_sms_request_cooldown(org_cooldown, phone_number)
+                phone_token.save()
         except ValidationError as e:
             error_dict = self._get_error_dict(e)
             raise serializers.ValidationError(error_dict)
         except UserAlreadyVerified as e:
             raise serializers.ValidationError({"user": str(e)})
-        org_cooldown = self.organization.radius_settings.sms_cooldown
-        try:
-            self.enforce_sms_request_cooldown(org_cooldown, phone_number)
         except SmsAttemptCooldownException as e:
             return Response(
                 {"non_field_errors": [str(e)], "cooldown": e.cooldown}, status=400
             )
-        phone_token.save()
         return Response(
             {"cooldown": org_cooldown},
             status=201,
@@ -663,6 +829,7 @@ class CreatePhoneTokenView(
         last_phone_token = (
             PhoneToken.objects.filter(
                 user=self.request.user,
+                organization=self.organization,
                 phone_number=phone_number,
                 created__gt=datetime_now - timezone.timedelta(seconds=cooldown),
             )
@@ -705,6 +872,7 @@ class GetPhoneTokenStatusView(DispatchOrgMixin, GenericAPIView):
         self.validate_membership(user)
         is_active = PhoneToken.objects.filter(
             user=request.user,
+            organization=self.organization,
             phone_number=user.phone_number,
             valid_until__gte=timezone.now(),
             verified=False,
@@ -741,21 +909,45 @@ class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
         self.validate_membership(user)
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        phone_token = PhoneToken.objects.filter(user=user).order_by("-created").first()
+        phone_token = (
+            PhoneToken.objects.filter(user=user, organization=self.organization)
+            .order_by("-created")
+            .first()
+        )
         if not phone_token:
             return self._error_response(
                 _("No verification code found in the system for this user.")
             )
         try:
-            is_valid = phone_token.is_valid(serializer.data["code"])
+            is_valid = phone_token.is_valid(
+                serializer.data["code"], organization=self.organization
+            )
         except PhoneTokenException as e:
             return self._error_response(str(e))
         if not is_valid:
             return self._error_response(_("Invalid code."))
         else:
-            user.registered_user.is_verified = True
-            user.registered_user.method = "mobile_phone"
-            user.is_active = True
+            old_phone_number = str(user.phone_number) if user.phone_number else None
+            phone_number_changed = old_phone_number and old_phone_number != str(
+                phone_token.phone_number
+            )
+            if phone_number_changed:
+                # The shipped registration methods only tie identity verification
+                # to the stored phone number for mobile_phone entries.
+                RegisteredUser.objects.filter(
+                    user=user,
+                    method="mobile_phone",
+                ).exclude(organization=self.organization,).update(is_verified=False)
+            reg_user, __ = RegisteredUser.get_or_create_for_user_and_org(
+                user=user,
+                organization=self.organization,
+                defaults={
+                    "is_verified": True,
+                    "method": "mobile_phone",
+                },
+            )
+            reg_user.is_verified = True
+            reg_user.method = "mobile_phone"
             # Update username if phone_number is used as username
             if user.username == user.phone_number:
                 user.username = phone_token.phone_number
@@ -763,9 +955,14 @@ class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
             # we can write it to the user field
             user.phone_number = phone_token.phone_number
             user.save()
-            user.registered_user.save()
-            # delete any radius token cache key if present
-            cache.delete(f"rt-{phone_token.phone_number}")
+            reg_user.save()
+            # Delete any cached radius token for either the previous or current
+            # phone number so callers cannot keep using stale cached entries.
+            cache_keys = {f"rt-{phone_token.phone_number}"}
+            if old_phone_number:
+                cache_keys.add(f"rt-{old_phone_number}")
+            for cache_key in cache_keys:
+                cache.delete(cache_key)
             return Response(None, status=200)
 
 
@@ -801,7 +998,9 @@ class ChangePhoneNumberView(ThrottledAPIMixin, CreatePhoneTokenView):
         # the user is marked unverified, so that if the
         # creation of the phone token fails, the
         # the user's is_verified state remains unchanged
-        self.create_phone_token(*args, **kwargs)
+        self.create_phone_token(
+            *args, phone_number=serializer.validated_data["phone_number"], **kwargs
+        )
         serializer.save()
         return Response(None, status=200)
 
@@ -811,6 +1010,51 @@ class ChangePhoneNumberView(ThrottledAPIMixin, CreatePhoneTokenView):
 
 
 change_phone_number = ChangePhoneNumberView.as_view()
+
+
+class UpdateRegisteredUserMethodView(DispatchOrgMixin, GenericAPIView):
+    authentication_classes = (BearerAuthentication, SessionAuthentication)
+    permission_classes = (IsAuthenticated,)
+    serializer_class = UpdateRegisteredUserMethodSerializer
+
+    @swagger_auto_schema(
+        operation_description=("""
+            **Requires the user auth token (Bearer Token).**
+            Allows users to update their organization-specific registration
+            method.
+            The method can only be updated when it is currently
+            set to 'pending_verification'.
+            Once updated, it cannot be changed again via this endpoint.
+            """),
+        responses={
+            200: "Method updated successfully",
+            400: (
+                "Invalid request (method is not 'pending_verification' "
+                "or invalid method value)"
+            ),
+            401: "Authentication required",
+            404: "RegisteredUser not found for this user and organization",
+        },
+    )
+    def post(self, request, slug):
+        user = request.user
+        self.validate_membership(user)
+        reg_user = get_object_or_404(
+            RegisteredUser,
+            user_id=user.pk,
+            organization=self.organization,
+        )
+        serializer = self.get_serializer(
+            instance=reg_user, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(
+            {"method": serializer.instance.method}, status=status.HTTP_200_OK
+        )
+
+
+update_registered_user_registration_method = UpdateRegisteredUserMethodView.as_view()
 
 
 class RadiusAccountingFilter(AccountingFilter):
@@ -865,12 +1109,6 @@ class RadiusGroupFilter(OrganizationManagedFilter, filters.FilterSet):
         model = RadiusGroup
 
 
-class RadiusGroupPaginator(PageNumberPagination):
-    page_size = 20
-    page_size_query_param = "page_size"
-    max_page_size = 100
-
-
 @method_decorator(
     name="get",
     decorator=swagger_auto_schema(
@@ -895,7 +1133,8 @@ class RadiusGroupListView(
     filterset_class = RadiusGroupFilter
     filter_backends = [DjangoFilterBackend, SearchFilter]
     search_fields = ["name"]
-    pagination_class = RadiusGroupPaginator
+    pagination_class = OpenWispPagination
+    pagination_page_size = 20
 
 
 radius_group_list = RadiusGroupListView.as_view()
@@ -1016,7 +1255,8 @@ class RadiusUserGroupFilter(OrganizationManagedFilter, filters.FilterSet):
     ),
 )
 class RadiusUserGroupListCreateView(BaseRadiusUserGroupView, ListCreateAPIView):
-    pagination_class = RadiusGroupPaginator
+    pagination_class = OpenWispPagination
+    pagination_page_size = 20
     filter_backends = [DjangoFilterBackend]
     filterset_class = RadiusUserGroupFilter
 

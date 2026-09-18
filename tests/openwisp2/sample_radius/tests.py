@@ -1,5 +1,9 @@
+from django.urls import reverse
+
+from openwisp_radius.tests import test_migrations as base_migration_tests
 from openwisp_radius.tests.test_admin import TestAdmin as BaseTestAdmin
 from openwisp_radius.tests.test_api.test_api import TestApi as BaseTestApi
+from openwisp_radius.tests.test_api.test_batch import TestBatch as BaseTestBatch
 from openwisp_radius.tests.test_api.test_freeradius_api import (
     TestApiReject as BaseTestApiReject,
 )
@@ -30,6 +34,12 @@ from openwisp_radius.tests.test_api.test_rest_token import (
 from openwisp_radius.tests.test_batch_add_users import (
     TestCSVUpload as BaseTestCSVUpload,
 )
+from openwisp_radius.tests.test_batch_add_users import (
+    TestPrefixUpload as BaseTestPrefixUpload,
+)
+from openwisp_radius.tests.test_batch_add_users import (
+    TestTransactionBatch as BaseTestTransactionBatch,
+)
 from openwisp_radius.tests.test_commands import TestCommands as BaseTestCommands
 from openwisp_radius.tests.test_models import TestNas as BaseTestNas
 from openwisp_radius.tests.test_models import (
@@ -54,13 +64,12 @@ from openwisp_radius.tests.test_saml.test_views import (
 from openwisp_radius.tests.test_social import TestSocial as BaseTestSocial
 from openwisp_radius.tests.test_token import TestPhoneToken as BaseTestPhoneToken
 from openwisp_radius.tests.test_token import TestRadiusToken as BaseTestRadiusToken
-from openwisp_radius.tests.test_upgrader_script import (
-    TestUpgradeFromDjangoFreeradius as BaseTestUpgradeFromDjangoFreeradius,
-)
 from openwisp_radius.tests.test_users_integration import (
     TestUsersIntegration as BaseTestUsersIntegration,
 )
 from openwisp_radius.tests.test_utils import TestUtils as BaseTestUtils
+
+from .api.views import BatchSerializer
 
 additional_fields = [
     ("social_security_number", "123-45-6789"),
@@ -74,6 +83,16 @@ class TestAdmin(BaseTestAdmin):
 
 class TestApi(BaseTestApi):
     pass
+
+
+class TestBatch(BaseTestBatch):
+    def test_batch_uses_custom_creation_serializer(self):
+        self._superuser_login()
+        response = self.client.post(
+            reverse("radius:batch"),
+            self._radius_batch_prefix_data(),
+        )
+        self.assertTrue(response.json()["customized"])
 
 
 class TestFreeradiusApi(BaseTestFreeradiusApi):
@@ -108,15 +127,19 @@ class TestCSVUpload(BaseTestCSVUpload):
     pass
 
 
+class TestPrefixUpload(BaseTestPrefixUpload):
+    pass
+
+
+class TestTransactionBatch(BaseTestTransactionBatch):
+    pass
+
+
 class TestCommands(BaseTestCommands):
     pass
 
 
 class TestNas(BaseTestNas):
-    pass
-
-
-class TestUpgradeFromDjangoFreeradius(BaseTestUpgradeFromDjangoFreeradius):
     pass
 
 
@@ -185,8 +208,21 @@ class TestLoginView(BaseTestLoginView):
     pass
 
 
+class TestMigrationRegisteredUserMultitenancy(
+    base_migration_tests.TestMigrationRegisteredUserMultitenancy,
+):
+    pass
+
+
+class TestPhoneTokenOrganizationPopulateResolution(
+    base_migration_tests.TestPhoneTokenOrganizationPopulateResolution,
+):
+    pass
+
+
 del BaseTestAdmin
 del BaseTestApi
+del BaseTestBatch
 del BaseTestFreeradiusApi
 del BaseTestApiReject
 del BaseTestAutoGroupname
@@ -197,6 +233,8 @@ del BaseTestOgranizationRadiusSettings
 del BaseTestPhoneVerification
 del BaseTestIsSmsVerificationEnabled
 del BaseTestCSVUpload
+del BaseTestPrefixUpload
+del BaseTestTransactionBatch
 del BaseTestCommands
 del BaseTestNas
 del BaseTestRadiusAccounting
@@ -211,6 +249,7 @@ del BaseTestRadiusToken
 del BaseTestPhoneToken
 del BaseTestUsersIntegration
 del BaseTestUtils
-del BaseTestUpgradeFromDjangoFreeradius
 del BaseTestAssertionConsumerServiceView
 del BaseTestLoginView
+del base_migration_tests
+del BatchSerializer

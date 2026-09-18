@@ -1,19 +1,25 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from allauth.socialaccount.models import SocialAccount
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ObjectDoesNotExist
+from django.contrib.sessions.backends.db import SessionStore
+from django.test import RequestFactory
 from django.urls import reverse
+from django.utils.timezone import now
 from rest_framework.authtoken.models import Token
 from swapper import load_model
 
 from openwisp_radius import settings as app_settings
+from openwisp_radius.api.serializers import RadiusUserSerializer
 from openwisp_radius.utils import get_organization_radius_settings
+from openwisp_users.auth import SESSION_KEY
 from openwisp_utils.tests import capture_stderr
 
 from .mixins import ApiTokenMixin, BaseTestCase
 
 RadiusToken = load_model("openwisp_radius", "RadiusToken")
+RegisteredUser = load_model("openwisp_radius", "RegisteredUser")
 OrganizationRadiusSettings = load_model("openwisp_radius", "OrganizationRadiusSettings")
 Organization = load_model("openwisp_users", "Organization")
 User = get_user_model()
@@ -85,6 +91,12 @@ class TestSocial(ApiTokenMixin, BaseTestCase):
     def test_redirect_cp_301(self):
         user = self._create_social_user()
         self.client.force_login(user)
+        # force_login goes through the password-based login signal by
+        # default; mark the session as social like a real social login
+        # would, so the assertion below exercises the intended scenario.
+        session = self.client.session
+        session[SESSION_KEY] = False
+        session.save()
         url = self.get_url()
         r = self.client.get(url, {"cp": "http://wifi.openwisp.org/cp"})
         self.assertEqual(r.status_code, 302)
@@ -100,15 +112,56 @@ class TestSocial(ApiTokenMixin, BaseTestCase):
         )
         self.assertIn(querystring, r.url)
         user = User.objects.filter(username="socialuser").first()
+        self.assertEqual(user.password_based_token, False)
+        self.assertEqual(rad_token.password_based, False)
         self.assertTrue(user.is_member(self.default_org))
         try:
-            reg_user = user.registered_user
-        except ObjectDoesNotExist:
+            reg_user = user.registered_users.get(organization=self.default_org)
+        except RegisteredUser.DoesNotExist:
             self.fail("RegisteredUser instance not found")
         self.assertEqual(reg_user.method, "social_login")
         # social login is not a legally valid identity verification method
         # so this should be always False when users sign up with this method
-        self.assertFalse(reg_user.is_verified)
+        self.assertEqual(reg_user.is_verified, False)
+
+    def test_pending_verification_registered_user_updated_for_org(self):
+        user = self._create_social_user()
+        registered_user = RegisteredUser.objects.create(
+            user=user,
+            organization=self.default_org,
+            method="pending_verification",
+            is_verified=False,
+        )
+        self.client.force_login(user)
+        url = self.get_url()
+        response = self.client.get(url, {"cp": "http://wifi.openwisp.org/cp"})
+        self.assertEqual(response.status_code, 302)
+        registered_users = RegisteredUser.objects.filter(
+            user=user, organization=self.default_org
+        )
+        self.assertEqual(registered_users.count(), 1)
+        registered_user.refresh_from_db()
+        self.assertEqual(registered_user.method, "social_login")
+        self.assertEqual(registered_user.is_verified, False)
+
+    @patch("openwisp_users.settings.USER_PASSWORD_EXPIRATION", 30)
+    def test_password_expired_not_reported_for_social_login(self):
+        org_user = self._get_org_user()
+        user = org_user.user
+        sa = SocialAccount(user=user, provider="facebook", uid="12345", extra_data="{}")
+        sa.full_clean()
+        sa.save()
+        User.objects.filter(pk=user.pk).update(
+            password_updated=(now() - timedelta(days=60)).date()
+        )
+        user.refresh_from_db()
+        self.assertEqual(user.has_password_expired(), True)
+        User.objects.filter(pk=user.pk).update(password_based_token=False)
+        user.refresh_from_db()
+        request = RequestFactory().get("/")
+        request.session = SessionStore()
+        data = RadiusUserSerializer(user, context={"request": request}).data
+        self.assertEqual(data["password_expired"], False)
 
     def test_authorize_using_radius_user_token_200(self):
         self.test_redirect_cp_301()

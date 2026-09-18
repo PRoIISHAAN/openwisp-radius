@@ -214,6 +214,11 @@ The rate descriptions used in ``DEFAULT_THROTTLE_RATES`` may include
 ``second``, ``minute``, ``hour`` or ``day`` as the throttle period,
 setting it to ``None`` will result in no throttling.
 
+SMS token requests use the connection address in ``REMOTE_ADDR`` for their
+daily IP limit. When deploying behind a reverse proxy, configure it to
+replace ``REMOTE_ADDR`` with the client address and discard
+client-supplied forwarding headers.
+
 List of Endpoints
 ~~~~~~~~~~~~~~~~~
 
@@ -535,6 +540,14 @@ Param Description
 input string that can be an email, phone_number or username.
 ===== ======================================================
 
+.. note::
+
+    This endpoint always responds with **200** and a generic success
+    message, regardless of whether ``input`` matches an existing,
+    organization-member user. This is by design, to avoid leaking which
+    identifiers are registered. Integrators should not rely on a **404**
+    response to detect an unknown identifier.
+
 Confirm reset password
 ++++++++++++++++++++++
 
@@ -608,6 +621,10 @@ Returns:
   like confirming their mobile phone number
 - ``method`` registration/verification method used by the user to
   register, e.g.: ``mobile_phone``, ``social_login``, etc.
+- ``password_expired``: ``true`` if the user's local password has expired
+  **and** the current token was obtained with that password. It stays
+  ``false`` for tokens obtained via SSO, SAML or a magic link, even if the
+  user also has an expired local password.
 - ``username``
 - ``email``
 - ``phone_number``
@@ -714,7 +731,10 @@ Create SMS token
 **Requires the user auth token (Bearer Token)**.
 
 Used for SMS verification, sends a code via SMS to the phone number of the
-user.
+user. The number must comply with
+:ref:`OPENWISP_RADIUS_ALLOWED_MOBILE_PREFIXES
+<openwisp_radius_allowed_mobile_prefixes>` and
+``OPENWISP_RADIUS_ALLOW_FIXED_LINE_OR_MOBILE``.
 
 .. code-block:: text
 
@@ -803,6 +823,48 @@ Param        Description
 phone_number string
 ============ ===========
 
+Update user registration method
++++++++++++++++++++++++++++++++
+
+**Requires the user auth token (Bearer Token)**.
+
+Allows users to update their registered user method for an organization.
+The method can only be updated when it is currently set to
+``pending_verification``. Once updated, it cannot be changed again via
+this endpoint.
+
+This endpoint is used during cross-organization login when a user
+authenticates to a new organization. The user must complete verification
+for that organization before they can create account with the new
+organization.
+
+.. code-block:: text
+
+    /api/v1/radius/organization/<organization-slug>/account/registration-method/
+
+Responds only to **POST**.
+
+Parameters:
+
+====== ===========
+Param  Description
+====== ===========
+method string (\*)
+====== ===========
+
+(\*) ``method`` must be one of the available
+:ref:`registration/verification methods
+<openwisp_radius_needs_identity_verification>`, excluding
+``pending_verification``.
+
+**Success Response (200 OK)**:
+
+.. code-block:: json
+
+    {
+        "method": "mobile_phone"
+    }
+
 .. _radius_batch_user_creation:
 
 Batch user creation
@@ -815,46 +877,135 @@ This API endpoint allows to use the features described in
 
     /api/v1/radius/batch/
 
+GET
+^^^
+
+Returns a list of batch user creation operations for the organizations
+managed by the requesting user. Results are paginated and can be filtered.
+The list does not include associated users.
+
+.. code-block:: text
+
+    /api/v1/radius/batch/?search=<batch_name>
+    /api/v1/radius/batch/?organization=<org_id>
+    /api/v1/radius/batch/?strategy=prefix
+
+Filters
+"""""""
+
+================= ===============================
+Filter Parameter  Description
+================= ===============================
+search            Search batches by name
+organization      Filter by organization id
+organization_slug Filter by organization slug
+strategy          Filter by strategy (prefix/csv)
+================= ===============================
+
+Pagination
+""""""""""
+
+Pagination is provided using page number pagination, the default page size
+is 20, which can be overridden using the ``page_size`` parameter, up to
+:ref:`OPENWISP_API_MAX_PAGE_SIZE <openwisp_api_max_page_size>` (100 by
+default).
+
 .. note::
 
-    This API endpoint allows to use the features described in
-    :doc:`importing_users` and :doc:`generating_users`.
+    The list response does not include ``user_credentials`` to avoid
+    repeatedly exposing plain-text credentials. Use the batch creation
+    response or the protected PDF or CSV download endpoints for
+    credentials.
 
-Responds only to **POST**, used to save a ``RadiusBatch`` instance.
+POST
+^^^^
+
+Creates a batch of users using a csv file or generates users with a given
+prefix.
 
 It is possible to generate the users of the ``RadiusBatch`` with two
 different strategies: csv or prefix.
 
 The csv method needs the following parameters:
 
-================= =================================
+================= ===================================================
 Param             Description
-================= =================================
+================= ===================================================
 name              Name of the operation
 strategy          csv
 csvfile           file with the users
 expiration_date   date of expiration of the users
+group             Optional UUID of the RADIUS group assigned to users
+notes             Optional internal notes for the batch
 organization_slug slug of organization of the users
-================= =================================
+================= ===================================================
 
 These others are for the prefix method:
 
-================= ==================================
+================= ===================================================
 Param             Description
-================= ==================================
+================= ===================================================
 name              name of the operation
 strategy          prefix
 prefix            prefix for the generation of users
 number_of_users   number of users
 expiration_date   date of expiration of the users
+group             Optional UUID of the RADIUS group assigned to users
+notes             Optional internal notes for the batch
 organization_slug slug of organization of the users
-================= ==================================
+================= ===================================================
 
 When using this strategy, in the response you can find the field
 ``user_credentials`` containing the list of users created (example:
 ``[['username', 'password'], ['sample_user', 'BBuOb5sN']]``) and the field
 ``pdf_link`` which can be used to download a PDF file containing the user
 credentials.
+
+Use the :ref:`RADIUS Groups endpoint <radius_groups>` to search for a
+group by organization before sending its UUID in the ``group`` parameter.
+The ``group`` and ``notes`` parameters are optional. When ``group`` is
+omitted, users retain the standard default-group behavior.
+
+.. note::
+
+    The synchronous ``201 Created`` response for prefix-generated batches
+    includes ``user_credentials``. The asynchronous ``202 Accepted``
+    response does not include credentials; use the ``pdf_link`` after
+    completion.
+
+Batch Detail
+++++++++++++
+
+.. code-block:: text
+
+    /api/v1/radius/batch/<uuid>/
+
+GET
+^^^
+
+Returns a single batch user creation operation by its UUID. The response
+does not include ``user_credentials``.
+
+For completed prefix batches, the response includes a ``pdf_link`` field
+pointing to the protected PDF download endpoint. For CSV batches with an
+uploaded file, the response includes a ``csv_link`` field pointing to the
+protected CSV download endpoint.
+
+Associated users are returned in the ``users`` field as a paginated
+response. The default page size is 100 and can be changed with the
+``page`` and ``page_size`` query parameters.
+
+DELETE
+^^^^^^
+
+Deletes a batch user creation operation and its associated users. Returns
+``204 No Content`` on success.
+
+.. note::
+
+    Deletion is rejected while the batch ``status`` is ``processing``. The
+    API returns a ``409 Conflict`` response with a clear error message in
+    this case. Pending, completed, and failed batches can be deleted.
 
 Batch CSV Download
 ++++++++++++++++++
@@ -871,6 +1022,8 @@ users for a specific batch user creation operation. Example:
     curl -X GET \
         'http://127.0.0.1:8000/api/v1/radius/organization/default/batch/f4943c8a-462e-40ba-89b6-91a2541c9cf4/csv/' \
         -H 'Authorization: Bearer your-token-here'
+
+.. _radius_groups:
 
 RADIUS Groups
 +++++++++++++
@@ -905,8 +1058,9 @@ Pagination
 """"""""""
 
 Pagination is provided using page number pagination, the default page size
-is 20, which can be overridden using the ``page_size`` parameter (maximum
-100).
+is 20, which can be overridden using the ``page_size`` parameter, up to
+:ref:`OPENWISP_API_MAX_PAGE_SIZE <openwisp_api_max_page_size>` (100 by
+default).
 
 .. code-block:: text
 
@@ -973,8 +1127,10 @@ GET
 ^^^
 
 Returns the list of RADIUS group assignments for the specified user.
-Pagination is provided using page number pagination; default page size is
-20 and can be overridden with the ``page_size`` parameter (maximum 100).
+Pagination is provided using page number pagination. The default page size
+is 20 and can be overridden using the ``page_size`` parameter, up to
+:ref:`OPENWISP_API_MAX_PAGE_SIZE <openwisp_api_max_page_size>` (100 by
+default).
 
 .. code-block:: text
 

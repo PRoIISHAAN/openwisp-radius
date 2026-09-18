@@ -1,27 +1,22 @@
 import logging
+import warnings
 
-import phonenumbers
 import swapper
 from allauth.account.adapter import get_adapter
 from allauth.account.utils import setup_user_email
 from dj_rest_auth.registration.serializers import (
     RegisterSerializer as BaseRegisterSerializer,
 )
-from dj_rest_auth.serializers import (
-    PasswordResetSerializer as BasePasswordResetSerializer,
-)
-from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
-from django.contrib.sites.shortcuts import get_current_site
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.http import Http404
 from django.urls import reverse
-from django.utils import timezone
+from django.utils import formats, timezone
 from django.utils.translation import gettext_lazy as _
+from drf_yasg.utils import swagger_serializer_method
 from phonenumber_field.serializerfields import PhoneNumberField
-from phonenumbers import PhoneNumberType, phonenumberutil
 from rest_framework import serializers
 from rest_framework.authtoken.serializers import (
     AuthTokenSerializer as BaseAuthTokenSerializer,
@@ -29,14 +24,20 @@ from rest_framework.authtoken.serializers import (
 from rest_framework.fields import empty
 
 from openwisp_radius.api.exceptions import CrossOrgRegistrationException
-from openwisp_users.api.mixins import FilterSerializerByOrgManaged
+from openwisp_users.api.mixins import (
+    FilterSerializerByOrgManaged,
+    FilterSerializerByOrgMembership,
+)
+from openwisp_users.api.serializers import (
+    PasswordResetSerializer as BasePasswordResetSerializer,
+)
+from openwisp_users.auth import is_password_based_login
 from openwisp_users.backends import UsersAuthenticationBackend
 from openwisp_utils.api.serializers import ValidatedModelSerializer
 
 from .. import settings as app_settings
-from ..base.forms import PasswordResetForm
+from ..base.validators import is_mobile_phone_number, is_mobile_prefix_allowed
 from ..counters.exceptions import SkipCheck
-from ..registration import REGISTRATION_METHOD_CHOICES
 from ..utils import (
     get_group_checks,
     get_organization_radius_settings,
@@ -46,6 +47,7 @@ from ..utils import (
 from .utils import ErrorDictMixin, IDVerificationHelper
 
 logger = logging.getLogger(__name__)
+BROWSABLE_API_SELECT_CUTOFF = 100
 
 RadiusPostAuth = load_model("RadiusPostAuth")
 RadiusAccounting = load_model("RadiusAccounting")
@@ -58,6 +60,23 @@ RegisteredUser = load_model("RegisteredUser")
 OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
 Organization = swapper.load_model("openwisp_users", "Organization")
 User = get_user_model()
+
+
+class PasswordResetSerializer(BasePasswordResetSerializer):
+    """
+    DEPRECATED: Use openwisp_users.api.serializers.PasswordResetSerializer instead.
+    TODO: Remove in 1.4.0
+    """
+
+    def __init__(self, *args, **kwargs):
+        warnings.warn(
+            "openwisp_radius.api.serializers.PasswordResetSerializer is deprecated. "
+            "Use openwisp_users.api.serializers.PasswordResetSerializer instead. "
+            "This class will be removed in openwisp-radius 1.4.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
 
 
 class AllowAllUsersModelBackend(UsersAuthenticationBackend):
@@ -100,13 +119,7 @@ class AuthTokenSerializer(BaseAuthTokenSerializer):
 
 class AllowedMobilePrefixMixin(object):
     def is_prefix_allowed(self, phone_number, mobile_prefixes):
-        """
-        Verifies if a phone number's international prefix is allowed
-        """
-        country_code = phonenumbers.parse(str(phone_number)).country_code
-        if not mobile_prefixes:
-            return True
-        return "+" + str(country_code) in mobile_prefixes
+        return is_mobile_prefix_allowed(phone_number, mobile_prefixes)
 
 
 class AuthorizeSerializer(serializers.Serializer):
@@ -163,6 +176,8 @@ class RadiusAccountingSerializer(serializers.ModelSerializer):
     update_time = serializers.DateTimeField(required=False)
     input_octets = serializers.IntegerField(required=False)
     output_octets = serializers.IntegerField(required=False)
+    start_time_display = serializers.SerializerMethodField(read_only=True)
+    stop_time_display = serializers.SerializerMethodField(read_only=True)
     # this is needed otherwise serializer will ignore status_type
     # from the accounting request because it's not a model field
     status_type = serializers.ChoiceField(
@@ -183,6 +198,17 @@ class RadiusAccountingSerializer(serializers.ModelSerializer):
         else:
             radius_token.can_auth = False
             radius_token.save()
+
+    def _get_localized_datetime(self, value):
+        if value is None:
+            return None
+        return formats.localize(timezone.template_localtime(value))
+
+    def get_start_time_display(self, obj):
+        return self._get_localized_datetime(obj.start_time)
+
+    def get_stop_time_display(self, obj):
+        return self._get_localized_datetime(obj.stop_time)
 
     def is_valid(self, raise_exception=False):
         try:
@@ -440,7 +466,9 @@ class RadiusOrganizationField(serializers.SlugRelatedField):
         return queryset
 
 
-class RadiusBatchSerializer(serializers.ModelSerializer):
+class RadiusBatchSerializer(FilterSerializerByOrgMembership, ValidatedModelSerializer):
+    """Validate batch creation requests and return their credentials."""
+
     organization = serializers.PrimaryKeyRelatedField(
         help_text=("UUID of the organization in which the radius batch is created."),
         read_only=True,
@@ -451,6 +479,14 @@ class RadiusBatchSerializer(serializers.ModelSerializer):
         label="organization",
         slug_field="slug",
         write_only=True,
+        html_cutoff=BROWSABLE_API_SELECT_CUTOFF,
+    )
+    group = serializers.PrimaryKeyRelatedField(
+        queryset=RadiusGroup.objects.all(),
+        required=False,
+        allow_null=True,
+        label=_("Radius group"),
+        html_cutoff=BROWSABLE_API_SELECT_CUTOFF,
     )
     users = UserSerializer(
         many=True,
@@ -490,7 +526,6 @@ class RadiusBatchSerializer(serializers.ModelSerializer):
     status = serializers.CharField(read_only=True)
 
     def create(self, validated_data):
-        validated_data.pop("organization_slug", None)
         validated_data.pop("number_of_users", None)
         return super().create(validated_data)
 
@@ -514,51 +549,93 @@ class RadiusBatchSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"number_of_users": _("The field number_of_users cannot be empty")}
             )
-        validated_data = super().validate(data)
-        # Additional Model Validation
-        batch_data = validated_data.copy()
-        batch_data.pop("number_of_users", None)
-        batch_data["organization"] = batch_data.pop("organization_slug", None)
-        instance = self.instance or self.Meta.model(**batch_data)
-        instance.full_clean()
-        return validated_data
+        data["organization"] = data.pop("organization_slug")
+        return super().validate(data)
 
     class Meta:
         model = RadiusBatch
-        fields = "__all__"
+        fields = (
+            "id",
+            "strategy",
+            "organization",
+            "organization_slug",
+            "status",
+            "name",
+            "csvfile",
+            "prefix",
+            "number_of_users",
+            "group",
+            "users",
+            "expiration_date",
+            "notes",
+            "user_credentials",
+            "pdf_link",
+            "created",
+            "modified",
+        )
         read_only_fields = ("status", "user_credentials", "created", "modified")
 
 
-class PasswordResetSerializer(BasePasswordResetSerializer):
-    input = serializers.CharField()
-    email = None
-    password_reset_form_class = PasswordResetForm
+class BatchUserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = (
+            "id",
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+        )
+        read_only_fields = fields
 
-    def validate_input(self, value):
-        # Create PasswordResetForm with the serializer.
-        # Check BasePasswordResetSerializer.validate_email for details.
-        user = self.context.get("request").user
-        self.reset_form = self.password_reset_form_class(data={"email": user.email})
-        self.reset_form.is_valid()
-        return value
 
-    def save(self):
-        request = self.context.get("request")
-        password_reset_url = self.context.get("password_reset_url")
-        # Set some values to trigger the send_email method.
-        opts = {
-            "use_https": request.is_secure(),
-            "from_email": getattr(settings, "DEFAULT_FROM_EMAIL"),
-            "email_template_name": ("custom_password_reset_email.html"),
-            "request": request,
-            "extra_email_context": {
-                "subject": _("Password reset on %s") % (get_current_site(request).name),
-                "call_to_action_url": password_reset_url,
-                "call_to_action_text": _("Reset password"),
-            },
-        }
-        opts.update(self.get_email_options())
-        self.reset_form.save(**opts)
+class RadiusBatchReadSerializer(serializers.ModelSerializer):
+    """Return read-only batch data without creation credentials."""
+
+    organization = serializers.PrimaryKeyRelatedField(read_only=True)
+    pdf_link = serializers.SerializerMethodField(required=False, read_only=True)
+    csv_link = serializers.SerializerMethodField(required=False, read_only=True)
+    status = serializers.CharField(read_only=True)
+
+    def get_pdf_link(self, obj):
+        if obj.strategy == "prefix" and obj.status == RadiusBatch.COMPLETED:
+            request = self.context.get("request")
+            return request.build_absolute_uri(
+                reverse(
+                    "radius:download_rad_batch_pdf",
+                    args=[obj.organization.slug, obj.pk],
+                )
+            )
+        return None
+
+    def get_csv_link(self, obj):
+        if obj.csvfile:
+            request = self.context.get("request")
+            csv_url = reverse(
+                "radius:radius_organization_batch_csv_read",
+                args=[obj.organization.slug, obj.pk],
+            )
+            return request.build_absolute_uri(csv_url)
+        return None
+
+    class Meta:
+        model = RadiusBatch
+        fields = (
+            "id",
+            "organization",
+            "name",
+            "strategy",
+            "status",
+            "expiration_date",
+            "prefix",
+            "group",
+            "notes",
+            "pdf_link",
+            "csv_link",
+            "created",
+            "modified",
+        )
+        read_only_fields = fields
 
 
 class RegisterSerializer(
@@ -585,8 +662,12 @@ class RegisterSerializer(
             'verification in its "Organization RADIUS Settings."'
         ),
         default="",
-        choices=REGISTRATION_METHOD_CHOICES,
+        choices=(),
     )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["method"].choices = app_settings.USER_SETTABLE_REGISTRATION_METHODS
 
     def validate_phone_number(self, phone_number):
         org = self.context["view"].organization
@@ -598,11 +679,10 @@ class RegisterSerializer(
                 raise serializers.ValidationError(
                     _("This international mobile prefix is not allowed.")
                 )
-            phone_number_type = phonenumberutil.number_type(phone_number)
-            allowed_types = [PhoneNumberType.MOBILE]
-            if app_settings.ALLOW_FIXED_LINE_OR_MOBILE:
-                allowed_types.append(PhoneNumberType.FIXED_LINE_OR_MOBILE)
-            if phone_number_type not in allowed_types:
+            if not is_mobile_phone_number(
+                phone_number,
+                allow_fixed_line_or_mobile=app_settings.ALLOW_FIXED_LINE_OR_MOBILE,
+            ):
                 raise serializers.ValidationError(
                     _("Only mobile phone numbers are allowed.")
                 )
@@ -653,7 +733,7 @@ class RegisterSerializer(
         if has_key("username"):
             user_lookup |= Q(username=data["username"])
         if has_key("email"):
-            user_lookup |= Q(email=data["email"])
+            user_lookup |= Q(email__iexact=data["email"])
         users = User.objects.filter(user_lookup).values_list("id", flat=True)
         if not users:
             # Error is not related to cross organization registration
@@ -702,9 +782,11 @@ class RegisterSerializer(
         # the custom_signup method contains the openwisp specific logic
         self.custom_signup(request, user)
         # create a RegisteredUser object for every user that registers through API
-        RegisteredUser.objects.create(
+        org = self.context["view"].organization
+        RegisteredUser.get_or_create_for_user_and_org(
             user=user,
-            method=self.validated_data["method"],
+            organization=org,
+            defaults={"method": self.validated_data["method"]},
         )
         setup_user_email(request, user, [])
         return user
@@ -767,8 +849,55 @@ class ChangePhoneNumberSerializer(
         # yet, tha will be done by the phone token validation view
         # once the phone number has been validated
         # at this point we flag the user as unverified again
-        self.user.registered_user.is_verified = False
-        self.user.registered_user.save()
+        org = self.context["view"].organization
+        reg_user, _ = RegisteredUser.get_or_create_for_user_and_org(
+            user=self.user,
+            organization=org,
+            defaults={"is_verified": False, "method": ""},
+        )
+        reg_user.is_verified = False
+        reg_user.save()
+
+
+class UpdateRegisteredUserMethodSerializer(ValidatedModelSerializer):
+    method = serializers.ChoiceField(
+        choices=app_settings.USER_SETTABLE_REGISTRATION_METHODS,
+        help_text=_(
+            "The registration method to set for the user. "
+            "Cannot be 'pending_verification'."
+        ),
+    )
+
+    class Meta:
+        model = RegisteredUser
+        fields = ["method"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["method"].choices = app_settings.USER_SETTABLE_REGISTRATION_METHODS
+
+    def validate_method(self, value):
+        if value == "pending_verification":
+            raise serializers.ValidationError(
+                _("'pending_verification' cannot be set as a registration method.")
+            )
+        return value
+
+    def validate(self, attrs):
+        if self.instance.method != "pending_verification":
+            raise serializers.ValidationError(
+                {
+                    "method": _(
+                        "Method can only be updated from pending verification state."
+                    )
+                }
+            )
+        return attrs
+
+    def update(self, instance, validated_data):
+        instance.method = validated_data["method"]
+        instance.save()
+        return instance
 
 
 class RadiusUserSerializer(serializers.ModelSerializer):
@@ -776,12 +905,9 @@ class RadiusUserSerializer(serializers.ModelSerializer):
     Used to return information about the logged in user
     """
 
-    is_verified = serializers.BooleanField(source="registered_user.is_verified")
-    method = serializers.CharField(
-        source="registered_user.method",
-        allow_null=True,
-    )
-    password_expired = serializers.BooleanField(source="has_password_expired")
+    is_verified = serializers.SerializerMethodField()
+    method = serializers.SerializerMethodField()
+    password_expired = serializers.SerializerMethodField()
     radius_user_token = serializers.CharField(source="radius_token.key", default=None)
 
     class Meta:
@@ -800,3 +926,35 @@ class RadiusUserSerializer(serializers.ModelSerializer):
             "password_expired",
             "radius_user_token",
         ]
+
+    def _get_registered_user(self, obj):
+        if not hasattr(self, "_registered_user_cache"):
+            self._registered_user_cache = {}
+        if obj.pk not in self._registered_user_cache:
+            view = self.context.get("view")
+            organization = getattr(view, "organization", None)
+            reg_user = None
+            # We iterate over .all() instead of using .filter() because callers
+            # of this serializer (e.g. validate_auth_token) prefetch
+            # "registered_users" via prefetch_related. Using .all() hits the
+            # in-memory prefetch cache (0 DB queries), whereas .filter() would
+            # bypass the cache and issue a new query every time.
+            for ru in obj.registered_users.all():
+                if organization and ru.organization_id == organization.pk:
+                    reg_user = ru
+                    break
+            self._registered_user_cache[obj.pk] = reg_user
+        return self._registered_user_cache[obj.pk]
+
+    def get_is_verified(self, obj):
+        reg_user = self._get_registered_user(obj)
+        return reg_user.is_verified if reg_user else None
+
+    def get_method(self, obj):
+        reg_user = self._get_registered_user(obj)
+        return reg_user.method if reg_user else None
+
+    @swagger_serializer_method(serializer_or_field=serializers.BooleanField)
+    def get_password_expired(self, obj):
+        request = self.context.get("request")
+        return is_password_based_login(request, user=obj) and obj.has_password_expired()

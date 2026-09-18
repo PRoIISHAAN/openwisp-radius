@@ -1,13 +1,12 @@
 import csv
 import ipaddress
-import json
 import logging
 import os
 import string
 from datetime import timedelta
 from io import StringIO
+from typing import Iterable
 
-import django
 import phonenumbers
 import swapper
 from asgiref.sync import async_to_sync
@@ -15,24 +14,21 @@ from channels.layers import get_channel_layer
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
-from django.core.exceptions import ObjectDoesNotExist, ValidationError
+from django.core.exceptions import ValidationError
 from django.core.mail import send_mail
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models, transaction
-from django.db.models import ProtectedError, Q
+from django.db.models import JSONField, ProtectedError, Q
 from django.utils import timezone
 from django.utils.crypto import get_random_string
-from django.utils.timezone import now
+from django.utils.timezone import localdate, now
 from django.utils.translation import gettext_lazy as _
-from jsonfield import JSONField
 from model_utils.fields import AutoLastModifiedField
 from openwisp_notifications.signals import notify
 from phonenumber_field.modelfields import PhoneNumberField
 from private_storage.fields import PrivateFileField
 
-from openwisp_radius.registration import (
-    REGISTRATION_METHOD_CHOICES,
-    get_registration_choices,
-)
+from openwisp_radius.registration import get_registration_choices
 from openwisp_radius.tasks import process_radius_batch
 from openwisp_users.mixins import OrgMixin
 from openwisp_utils.base import KeyField, TimeStampedEditableModel, UUIDModel
@@ -53,6 +49,7 @@ from ..settings import (
     BATCH_MAIL_SUBJECT,
     DEFAULT_PASSWORD_RESET_URL,
 )
+from ..signals import radius_accounting_closed
 from ..utils import (
     SmsMessage,
     decode_byte_data,
@@ -60,10 +57,16 @@ from ..utils import (
     generate_sms_token,
     get_sms_default_valid_until,
     load_model,
+    mask_phone_number,
     prefix_generate_users,
     validate_csvfile,
 )
-from .validators import ipv6_network_validator, password_reset_url_validator
+from .validators import (
+    ipv6_network_validator,
+    is_mobile_phone_number,
+    is_mobile_prefix_allowed,
+    password_reset_url_validator,
+)
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -175,6 +178,9 @@ _COA_ENABLED_HELP_TEXT = _("Whether RADIUS Change Of Authoization (CoA) is enabl
 _LOGIN_URL_HELP_TEXT = _("Enter the URL where users can log in to the wifi service")
 _STATUS_URL_HELP_TEXT = _("Enter the URL where users can log out from the wifi service")
 _PASSWORD_RESET_URL_HELP_TEXT = _("Enter the URL where users can reset their password")
+_REGISTRATION_UNIQUE_VALIDATION_ERROR = _(
+    "A user cannot have more than one registration record in the same organization."
+)
 OPTIONAL_SETTINGS = app_settings.OPTIONAL_REGISTRATION_FIELDS
 
 
@@ -527,19 +533,65 @@ class AbstractRadiusAccounting(OrgMixin, models.Model):
         blank=True,
     )
 
-    def save(self, *args, **kwargs):
-        if not self.start_time:
-            self.start_time = now()
-        super(AbstractRadiusAccounting, self).save(*args, **kwargs)
-
     class Meta:
         db_table = "radacct"
         verbose_name = _("accounting")
         verbose_name_plural = _("accountings")
         abstract = True
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # used for radius_accounting_closed signal
+        self._set_initial_stop_time()
+
+    def refresh_from_db(self, *args, **kwargs):
+        super().refresh_from_db(*args, **kwargs)
+        fields = kwargs.get("fields")
+        self._set_initial_stop_time(fields=fields)
+
+    def save(self, *args, **kwargs):
+        created = self._state.adding
+        update_fields = kwargs.get("update_fields")
+        if not self.start_time:
+            self.start_time = now()
+            if update_fields is not None:
+                update_fields = set(update_fields) | {"start_time"}
+                kwargs["update_fields"] = update_fields
+        super(AbstractRadiusAccounting, self).save(*args, **kwargs)
+        self._emit_radius_accounting_closed(
+            created=created, update_fields=update_fields
+        )
+        # reset after save
+        self._set_initial_stop_time(update_fields)
+
+    def _set_initial_stop_time(self, fields=None):
+        if fields is None or "stop_time" in fields:
+            self._initial_stop_time = self.stop_time
+
+    def _emit_radius_accounting_closed(self, created, update_fields=None):
+        """Detect whether this save closed the session and emit the signal."""
+        if update_fields is not None and "stop_time" not in update_fields:
+            return
+        being_closed = self.stop_time is not None and (
+            created or self._initial_stop_time is None
+        )
+        if being_closed:
+            self.emit_radius_accounting_closed([self])
+
     def __str__(self):
         return self.unique_id
+
+    @classmethod
+    def emit_radius_accounting_closed(
+        cls, sessions: Iterable["AbstractRadiusAccounting"]
+    ) -> None:
+        """Emit radius_accounting_closed after commit for closed sessions."""
+        for session in sessions:
+            transaction.on_commit(
+                lambda session=session: radius_accounting_closed.send(
+                    sender=session.__class__, instance=session
+                )
+            )
 
     @classmethod
     def close_stale_sessions(cls, days=None, hours=None):
@@ -577,13 +629,39 @@ class AbstractRadiusAccounting(OrgMixin, models.Model):
         """
         if not called_station_id:
             return 0
-        stale_sessions = cls.objects.filter(
-            called_station_id=called_station_id,
-            stop_time__isnull=True,
-        )
-        closed_count = stale_sessions.update(
-            stop_time=now(), terminate_cause="NAS-Reboot"
-        )
+        stop_time = now()
+        closed_count = 0
+        batch_size = 1000
+        has_more_sessions = True
+        while has_more_sessions:
+            with transaction.atomic():
+                closed_sessions = list(
+                    cls.objects.select_for_update()
+                    .filter(
+                        called_station_id=called_station_id,
+                        stop_time__isnull=True,
+                    )
+                    .only(
+                        "unique_id",
+                        "username",
+                        "organization_id",
+                        "input_octets",
+                        "output_octets",
+                        "calling_station_id",
+                        "called_station_id",
+                        "stop_time",
+                    )[:batch_size]
+                )
+                has_more_sessions = len(closed_sessions) == batch_size
+                if not closed_sessions:
+                    continue
+                for session in closed_sessions:
+                    session.stop_time = stop_time
+                    session.terminate_cause = "NAS-Reboot"
+                closed_count += cls.objects.bulk_update(
+                    closed_sessions, fields=["stop_time", "terminate_cause"]
+                )
+                cls.emit_radius_accounting_closed(closed_sessions)
         return closed_count
 
 
@@ -928,6 +1006,7 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
         null=True,
         blank=True,
         verbose_name="PDF",
+        encoder=DjangoJSONEncoder,
     )
     expiration_date = models.DateField(
         verbose_name=_("expiration date"),
@@ -935,6 +1014,14 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
         blank=True,
         help_text=_("If left blank users will never expire"),
     )
+    group = models.ForeignKey(
+        "RadiusGroup",
+        verbose_name=_("radius group"),
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    notes = models.TextField(_("notes"), blank=True, help_text=_("internal notes"))
 
     class Meta:
         db_table = "radbatch"
@@ -946,7 +1033,30 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
     def __str__(self):
         return self.name
 
+    def _validate_expiration(self):
+        """Reject past expiration dates unless they already exist."""
+        if not self.expiration_date:
+            return
+        today = localdate()
+        is_past_expiration = self.expiration_date < today
+        previous_state = None
+        if not self._state.adding and is_past_expiration:
+            previous_state = (
+                self._meta.model.objects.filter(pk=self.pk)
+                .only("expiration_date")
+                .first()
+            )
+        if is_past_expiration:
+            db_expiration_date = None
+            if previous_state:
+                db_expiration_date = previous_state.expiration_date
+            if self._state.adding or db_expiration_date != self.expiration_date:
+                raise ValidationError(
+                    {"expiration_date": _("Expiration date cannot be in the past.")}
+                )
+
     def clean(self):
+        self._validate_expiration()
         if self.strategy == "csv" and not self.csvfile:
             raise ValidationError(
                 {"csvfile": _("This field cannot be blank.")}, code="invalid"
@@ -980,6 +1090,7 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
             )
         if self.strategy == "csv":
             validate_csvfile(self.csvfile.file)
+        self._validate_org_relation("group", field_error="group")
         super().clean()
 
     def add(self, reader, password_length=BATCH_DEFAULT_PASSWORD_LENGTH):
@@ -1023,16 +1134,36 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
         for user in users_list:
             user.full_clean()
             self.save_user(user)
-        self.user_credentials = json.dumps(user_credentials)
+        self.user_credentials = user_credentials
         self.full_clean()
         self.save()
 
     def get_or_create_user(self, row, users_list, password_length):
         User = get_user_model()
         username, password, email, first_name, last_name = row
-        if email and User.objects.filter(email=email).exists():
-            user = User.objects.get(email=email)
-            return user, None
+        # Users created from earlier rows in the same CSV are saved only after
+        # every row is processed, so the database lookup cannot find them yet.
+        # Search users_list too, preventing another row in the same CSV with
+        # the same email in different casing from creating a second account.
+        # A saved user may be in both lists, so count it once rather than
+        # reporting two matches as an ambiguous email address.
+        if email:
+            matching_users = [
+                user
+                for user in users_list
+                if user.email and user.email.casefold() == email.casefold()
+            ]
+            matching_users.extend(User.objects.filter(email__iexact=email)[:2])
+            users = {
+                user.pk if user.pk is not None else id(user): user
+                for user in matching_users
+            }
+            if len(users) > 1:
+                raise ValidationError(
+                    {"email": _("Multiple users match this email address.")}
+                )
+            if users:
+                return next(iter(users.values())), None
         generated_password = None
         username, password, email, first_name, last_name = row
         if not username and email:
@@ -1055,34 +1186,91 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
         return user, generated_password
 
     def save_user(self, user):
+        self._validate_org_relation("group", field_error="group")
         OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
         RegisteredUser = swapper.load_model("openwisp_radius", "RegisteredUser")
+        RadiusUserGroup = swapper.load_model("openwisp_radius", "RadiusUserGroup")
+        if self.expiration_date is not None:
+            user.expiration_date = self.expiration_date
         user.save()
-        registered_user = RegisteredUser(user=user, method="manual")
-        if self.organization.radius_settings.needs_identity_verification:
+        radius_settings = self.organization.radius_settings
+        registered_user, created = RegisteredUser.get_or_create_for_user_and_org(
+            user=user,
+            organization=self.organization,
+            defaults={
+                "method": "manual",
+                "is_verified": radius_settings.needs_identity_verification,
+            },
+        )
+        if (
+            not created
+            and self.organization.radius_settings.needs_identity_verification
+        ):
+            registered_user.method = "manual"
             registered_user.is_verified = True
-        registered_user.save()
+            registered_user.save()
         self.users.add(user)
-        if OrganizationUser.objects.filter(
+        if not OrganizationUser.objects.filter(
             user=user, organization=self.organization
         ).exists():
-            return
-        obj = OrganizationUser(
-            user=user, organization=self.organization, is_admin=False
-        )
-        obj.full_clean()
-        obj.save()
+            obj = OrganizationUser(
+                user=user, organization=self.organization, is_admin=False
+            )
+            obj.full_clean()
+            obj.save()
+        if self.group:
+            RadiusUserGroup.objects.filter(
+                user=user, group__organization=self.organization
+            ).delete()
+            user_group = RadiusUserGroup(user=user, group=self.group)
+            user_group.full_clean()
+            user_group.save()
 
     def delete(self):
         self.users.all().delete()
         super().delete()
         self._remove_files()
 
-    def expire(self):
-        users = self.users.all()
-        for u in users:
-            u.is_active = False
-            u.save()
+    def _get_locked(self):
+        """Reload and lock the current row before changing its lifecycle state."""
+        return self._meta.model.objects.select_for_update().get(
+            pk=self.pk, organization_id=self.organization_id
+        )
+
+    def _get_deletable(self):
+        """Lock the batch and reject deletion once processing has been claimed."""
+        batch = self._get_locked()
+        if batch.status == self.PROCESSING:
+            raise exceptions.BatchProcessingError
+        return batch
+
+    def can_delete(self):
+        """Return whether the locked current batch is safe to delete."""
+        try:
+            with transaction.atomic():
+                self._get_deletable()
+        except (exceptions.BatchProcessingError, self._meta.model.DoesNotExist):
+            return False
+        return True
+
+    def delete_if_not_processing(self):
+        """Delete the locked current batch unless a worker is processing it."""
+        with transaction.atomic():
+            self._get_deletable().delete()
+
+    def start_processing(self):
+        """Atomically claim this pending batch for a single processing worker."""
+        with transaction.atomic():
+            try:
+                batch = self._get_locked()
+            except self._meta.model.DoesNotExist:
+                return False
+            if batch.status != self.PENDING:
+                return False
+            batch.status = self.PROCESSING
+            batch.save(update_fields=["status"])
+        self.status = self.PROCESSING
+        return True
 
     def _remove_files(self):
         if self.csvfile:
@@ -1110,10 +1298,10 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
 
     def process(self, number_of_users=0, is_async=False):
         channel_layer = get_channel_layer()
+        if not self.start_processing():
+            return
         group_name = f"radius_batch_{self.pk}"
         try:
-            self.status = self.PROCESSING
-            self.save(update_fields=["status"])
             if self.strategy == "prefix":
                 self.prefix_add(self.prefix, number_of_users)
             elif self.strategy == "csv":
@@ -1157,7 +1345,6 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
 class AbstractRadiusToken(OrgMixin, TimeStampedEditableModel, models.Model):
     # key field is a primary key so additional id field will be redundant
     id = None
-    # tokens are not supposed to be modified, can be regenerated if necessary
     modified = None
     key = models.CharField(_("Key"), max_length=40, primary_key=True)
     user = models.OneToOneField(
@@ -1167,6 +1354,19 @@ class AbstractRadiusToken(OrgMixin, TimeStampedEditableModel, models.Model):
         default=False,
         help_text=(
             "Enable the radius token to be used for freeradius authorization request"
+        ),
+    )
+    # The key stays stable for non-disposable tokens. This authorization state
+    # is refreshed from the user's most recent authentication event.
+    password_based = models.BooleanField(
+        blank=True,
+        null=True,
+        default=None,
+        help_text=_(
+            "Indicates whether the user's most recent authentication used the"
+            " local password. When false, the radius token is treated as"
+            " externally authenticated (eg: SSO, SAML), so the local password"
+            " expiration policy does not apply to it."
         ),
     )
 
@@ -1247,6 +1447,7 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
             " (optional, leave blank if unsure)"
         ),
         verbose_name=_("SMS meta data"),
+        encoder=DjangoJSONEncoder,
     )
     freeradius_allowed_hosts = FallbackTextField(
         help_text=_GET_IP_LIST_HELP_TEXT,
@@ -1451,9 +1652,13 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
         cache.delete(f"ip-{self.organization.pk}")
 
 
-class AbstractPhoneToken(TimeStampedEditableModel):
+class AbstractPhoneToken(OrgMixin, TimeStampedEditableModel):
     """
     Phone Verification Token (sent via SMS)
+
+    WARNING: Application code must not create or save phone tokens directly
+    with self.objects.create() or calling self.save() without first calling
+    self.full_clean(), as it can bypass policy and quota validation.
     """
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
@@ -1479,8 +1684,29 @@ class AbstractPhoneToken(TimeStampedEditableModel):
     def clean(self):
         if not hasattr(self, "user"):
             return
+        self._validate_phone_number_policy()
         self._validate_phone_number_uniqueness()
         self._validate_max_attempts()
+
+    def _validate_phone_number_policy(self):
+        self._validate_phone_number_prefix()
+        self._validate_phone_number_type()
+
+    def _validate_phone_number_prefix(self):
+        mobile_prefixes = self.organization.radius_settings.allowed_mobile_prefixes_list
+        if not is_mobile_prefix_allowed(self.phone_number, mobile_prefixes):
+            raise ValidationError(
+                {"phone_number": _("This international mobile prefix is not allowed.")}
+            )
+
+    def _validate_phone_number_type(self):
+        if not is_mobile_phone_number(
+            self.phone_number,
+            allow_fixed_line_or_mobile=app_settings.ALLOW_FIXED_LINE_OR_MOBILE,
+        ):
+            raise ValidationError(
+                {"phone_number": _("Only mobile phone numbers are allowed.")}
+            )
 
     def _validate_phone_number_uniqueness(self):
         """
@@ -1510,6 +1736,17 @@ class AbstractPhoneToken(TimeStampedEditableModel):
         date_end = date_start + timedelta(days=1)
         PhoneToken = load_model("PhoneToken")
         qs = PhoneToken.objects.filter(created__range=[date_start, date_end])
+        # acquire locks to prevent concurrent requests
+        # from bypassing the daily limit checks
+        locked_qs = qs.select_for_update()
+        locked_qs.filter(user=self.user).first()
+        # if it's a new IP, acquire a generic lock
+        # to prevent concurrent requests bypassing limits
+        if not locked_qs.filter(ip=self.ip).first():
+            # This is done on purpose, slow but safe!
+            # Generating millions of SMS messages per
+            # day is out of scope!
+            PhoneToken.objects.select_for_update().first()
         # limit generation of tokens per day by user
         user_token_count = qs.filter(user=self.user).count()
         if user_token_count >= app_settings.SMS_TOKEN_MAX_USER_DAILY:
@@ -1540,15 +1777,17 @@ class AbstractPhoneToken(TimeStampedEditableModel):
         return result
 
     def send_token(self):
-        OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
-        org_user = OrganizationUser.objects.filter(user=self.user).first()
-        if not org_user:
+        if self.organization is None:
             raise exceptions.NoOrgException(
                 _("The user {user} is not member of any organization").format(
                     user=self.user
                 )
             )
-        org_radius_settings = org_user.organization.radius_settings
+        try:
+            self._validate_phone_number_policy()
+        except ValidationError as error:
+            raise ValueError(error) from None
+        org_radius_settings = self.organization.radius_settings
         message = _(org_radius_settings.sms_message).format(
             organization=org_radius_settings.organization.name, code=self.token
         )
@@ -1557,30 +1796,60 @@ class AbstractPhoneToken(TimeStampedEditableModel):
             from_phone=str(org_radius_settings.sms_sender),
             to=[str(self.phone_number)],
         )
-        sms_message.send(meta_data=org_radius_settings.sms_meta_data)
+        # Masking the full phone number allows to keep a fragment for debugging.
+        # This aligns with SMS provider logs, which usually only track the
+        # recipient's phone number and the sender's IP and are not aware
+        # of our internal UUIDs.
+        masked_phone_number = mask_phone_number(self.phone_number)
+        try:
+            sms_message.send(meta_data=org_radius_settings.sms_meta_data)
+        except Exception:
+            logger.error(
+                "Failed to submit SMS token %s to the SMS backend for phone number %s, "
+                "user %s, organization %s.",
+                self.pk,
+                masked_phone_number,
+                self.user.pk,
+                self.organization.pk,
+            )
+            raise
+        else:
+            logger.info(
+                "SMS token %s was submitted to the SMS backend for phone number %s, "
+                "user %s, organization %s.",
+                self.pk,
+                masked_phone_number,
+                self.user.pk,
+                self.organization.pk,
+            )
 
-    def is_valid(self, token):
+    def is_valid(self, token, organization=None):
         self.attempts += 1
         try:
-            self.verified = self.__check(token)
+            self.verified = self.__check(token, organization=organization)
         except exceptions.PhoneTokenException as phone_error:
             self.save()
             raise phone_error
         self.save()
         return self.verified
 
-    def _validate_already_verified(self):
-        try:
-            if self.user.registered_user.is_verified:
-                logger.warning(f"User {self.user.pk} is already verified")
-                raise exceptions.UserAlreadyVerified(
-                    _("This user has been already verified.")
-                )
-        except ObjectDoesNotExist:
-            pass
+    def _validate_already_verified(self, organization=None):
+        RegisteredUser = swapper.load_model("openwisp_radius", "RegisteredUser")
+        if organization is not None:
+            reg_user = RegisteredUser.get_for_user_and_org(self.user, organization)
+            is_verified = reg_user is not None and reg_user.is_verified
+        else:
+            is_verified = RegisteredUser.objects.filter(
+                user=self.user, is_verified=True
+            ).exists()
+        if is_verified:
+            logger.warning(f"User {self.user.pk} is already verified")
+            raise exceptions.UserAlreadyVerified(
+                _("This user has been already verified.")
+            )
 
-    def __check(self, token):
-        self._validate_already_verified()
+    def __check(self, token, organization=None):
+        self._validate_already_verified(organization=organization)
         if self.attempts > app_settings.SMS_TOKEN_MAX_ATTEMPTS:
             logger.warning(
                 f"User {self.user} has reached the max "
@@ -1602,12 +1871,11 @@ class AbstractPhoneToken(TimeStampedEditableModel):
         return token == self.token
 
 
-class AbstractRegisteredUser(models.Model):
-    user = models.OneToOneField(
+class AbstractRegisteredUser(UUIDModel, OrgMixin):
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="registered_user",
-        primary_key=True,
+        related_name="registered_users",
     )
     method = models.CharField(
         _("registration method"),
@@ -1619,16 +1887,7 @@ class AbstractRegisteredUser(models.Model):
         max_length=64,
         blank=True,
         default="",
-        choices=(
-            REGISTRATION_METHOD_CHOICES
-            if django.VERSION < (5, 0)
-            # TODO: Remove when dropping support for Django 4.2
-            # In Django 5.0+, choices are normalized at model definition,
-            # creating a static list of tuples that doesn't update when registration
-            # methods are dynamically registered or unregistered. Using a callable
-            # ensures we always get the current choices from the registry.
-            else get_registration_choices
-        ),
+        choices=get_registration_choices,
     )
     is_verified = models.BooleanField(
         _("verified"),
@@ -1639,7 +1898,7 @@ class AbstractRegisteredUser(models.Model):
         default=False,
     )
     modified = AutoLastModifiedField(_("Last verification change"), editable=True)
-    _weak_verification_methods = {"", "email"}
+    _weak_verification_methods = {"", "email", "pending_verification"}
 
     @property
     def is_identity_verified_strong(self):
@@ -1649,6 +1908,39 @@ class AbstractRegisteredUser(models.Model):
         abstract = True
         verbose_name = _("Registration Information")
         verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "organization"],
+                name="unique_registered_user_per_org",
+                violation_error_message=_REGISTRATION_UNIQUE_VALIDATION_ERROR,
+            ),
+        ]
+
+    @classmethod
+    def get_or_create_for_user_and_org(cls, user, organization, defaults=None):
+        defaults = defaults or {}
+        return cls.objects.get_or_create(
+            user=user, organization=organization, defaults=defaults
+        )
+
+    @classmethod
+    def get_for_user_and_org(cls, user, organization):
+        prefetched_registered_users = getattr(user, "prefetched_registered_users", None)
+        if prefetched_registered_users is None:
+            prefetched_registered_users = getattr(
+                user,
+                "_prefetched_objects_cache",
+                {},
+            ).get("registered_users")
+        if prefetched_registered_users is not None:
+            for registered_user in prefetched_registered_users:
+                if registered_user.organization_id == organization.pk:
+                    return registered_user
+            return None
+        try:
+            return cls.objects.get(user=user, organization=organization)
+        except cls.DoesNotExist:
+            return None
 
     @classmethod
     def unverify_inactive_users(cls):

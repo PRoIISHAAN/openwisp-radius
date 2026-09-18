@@ -7,11 +7,14 @@ from django.contrib.admin import ModelAdmin, StackedInline
 from django.contrib.admin.utils import model_ngettext
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
-from django.http import HttpResponseRedirect
+from django.db.models import Prefetch
+from django.forms.models import BaseInlineFormSet
+from django.http import Http404, HttpResponseRedirect, JsonResponse
 from django.templatetags.static import static
-from django.urls import reverse
+from django.urls import path, reverse
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext
 
 from openwisp_users.admin import OrganizationAdmin, UserAdmin
 from openwisp_users.multitenancy import MultitenantAdminMixin, MultitenantOrgFilter
@@ -24,6 +27,7 @@ from openwisp_utils.admin import (
 from . import settings as app_settings
 from .base.admin_filters import RegisteredUserFilter
 from .base.forms import ModeSwitcherForm, RadiusBatchForm
+from .exceptions import BatchProcessingError
 from .settings import RADIUS_API_BASEURL, RADIUS_API_URLCONF
 from .utils import load_model
 
@@ -352,8 +356,10 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         "csvfile",
         "prefix",
         "number_of_users",
+        "group",
         "users",
         "expiration_date",
+        "notes",
         "created",
         "modified",
     ]
@@ -363,6 +369,7 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
     ]
     search_fields = ["name"]
     actions = ["delete_selected_batches"]
+    autocomplete_fields = ["group"]
     form = RadiusBatchForm
     help_text = {
         "text": _(
@@ -403,6 +410,51 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
             fields.remove("status")
         return fields
 
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if "group" in form.base_fields:
+            group_widget = form.base_fields["group"].widget
+            if hasattr(group_widget, "widget"):
+                group_widget = group_widget.widget
+            default_group_url = reverse(
+                f"admin:{self.opts.app_label}_{self.opts.model_name}_default_group",
+                args=["00000000-0000-0000-0000-000000000000"],
+            )
+            group_widget.attrs["data-default-url"] = default_group_url.replace(
+                "00000000-0000-0000-0000-000000000000", "__organization__"
+            )
+        return form
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "default-group/<uuid:organization_id>/",
+                self.admin_site.admin_view(self.default_group),
+                name=f"{self.opts.app_label}_{self.opts.model_name}_default_group",
+            ),
+        ]
+        return custom_urls + urls
+
+    def default_group(self, request, organization_id):
+        group_admin = self.admin_site._registry[RadiusGroup]
+        if not (
+            self.admin_site.has_permission(request)
+            and group_admin.has_view_permission(request)
+        ):
+            raise PermissionDenied
+        queryset = RadiusGroup.objects.filter(
+            organization_id=organization_id, default=True
+        )
+        if not request.user.is_superuser:
+            queryset = queryset.filter(
+                organization__in=request.user.organizations_managed
+            )
+        group = queryset.first()
+        if group is None:
+            raise Http404
+        return JsonResponse({"id": str(group.pk), "text": str(group)})
+
     def save_model(self, request, obj, form, change):
         if change:
             super().save_model(request, obj, form, change)
@@ -413,8 +465,18 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         obj.schedule_processing(number_of_users=num_users)
 
     def delete_model(self, request, obj):
-        obj.users.all().delete()
-        super(RadiusBatchAdmin, self).delete_model(request, obj)
+        try:
+            obj.delete_if_not_processing()
+        except BatchProcessingError:
+            self.message_user(
+                request,
+                _(
+                    "The radius batch object is currently being processed "
+                    "and cannot be deleted."
+                ),
+                level=messages.ERROR,
+            )
+            raise PermissionDenied
 
     def change_view(self, request, object_id, form_url="", extra_context=None):
         extra_context = extra_context or {}
@@ -456,11 +518,39 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
 
     @admin.action(description=_("Delete selected batches"), permissions=["delete"])
     def delete_selected_batches(self, request, queryset):
+        skipped = 0
+        deleted = 0
         for obj in queryset:
-            obj.delete()
-        self.message_user(
-            request, "Successfully deleted selected batches.", level=messages.SUCCESS
-        )
+            try:
+                obj.delete_if_not_processing()
+            except BatchProcessingError:
+                skipped += 1
+                continue
+            except RadiusBatch.DoesNotExist:
+                continue
+            deleted += 1
+        if skipped:
+            self.message_user(
+                request,
+                ngettext(
+                    "Skipped %(count)d batch that is currently being processed.",
+                    "Skipped %(count)d batches that are currently being processed.",
+                    skipped,
+                )
+                % {"count": skipped},
+                level=messages.WARNING,
+            )
+        if deleted:
+            self.message_user(
+                request,
+                ngettext(
+                    "Successfully deleted %(count)d batch.",
+                    "Successfully deleted %(count)d batches.",
+                    deleted,
+                )
+                % {"count": deleted},
+                level=messages.SUCCESS,
+            )
 
     def get_readonly_fields(self, request, obj=None):
         readonly_fields = super(RadiusBatchAdmin, self).get_readonly_fields(
@@ -472,6 +562,7 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
                 "prefix",
                 "csvfile",
                 "number_of_users",
+                "group",
                 "users",
                 "expiration_date",
                 "name",
@@ -479,12 +570,15 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
                 "status",
             ) + readonly_fields
         elif obj:
-            return ("status",) + readonly_fields
+            return ("status", "group") + readonly_fields
         return ("status",) + readonly_fields
 
     def has_delete_permission(self, request, obj=None):
-        if obj and obj.status == "processing":
-            return False
+        if obj:
+            if request.method == "POST" and not obj.can_delete():
+                return False
+            if request.method != "POST" and obj.status == RadiusBatch.PROCESSING:
+                return False
         return super().has_delete_permission(request, obj)
 
     def response_add(self, request, obj, post_url_continue=None):
@@ -534,11 +628,31 @@ class PhoneTokenInline(TimeReadonlyAdminMixin, StackedInline):
         return False
 
 
+class RegisteredUserFormset(BaseInlineFormSet):
+    def get_unique_error_message(self, unique_check):
+        # Django inline formsets perform their own uniqueness validation
+        # (BaseModelFormSet.validate_unique) *before* model-level validation runs.
+        # Because of this, the custom `violation_error_message` defined on
+        # `UniqueConstraint` is never surfaced in the admin UI.
+        #
+        # Overriding this method allows us to replace Django’s generic
+        # "Please correct the duplicate data for <field>." message with a
+        # domain-specific, user-friendly error that matches our constraint.
+        if unique_check == ("user", "organization"):
+            return _(
+                "A user cannot have more than one registration record in the"
+                " same organization."
+            )
+
+
 class RegisteredUserInline(StackedInline):
     model = RegisteredUser
     form = AlwaysHasChangedForm
+    formset = RegisteredUserFormset
     extra = 0
     readonly_fields = ("modified",)
+    fields = ("organization", "method", "is_verified", "modified")
+    autocomplete_fields = ("organization",)
 
     def has_delete_permission(self, request, obj=None):
         return False
@@ -549,22 +663,50 @@ UserAdmin.inlines += [
     RadiusUserGroupInline,
     PhoneTokenInline,
 ]
-UserAdmin.list_filter += (RegisteredUserFilter, "registered_user__method")
+UserAdmin.list_filter += (RegisteredUserFilter, "registered_users__method")
+user_admin_get_queryset = UserAdmin.get_queryset
+
+
+def get_queryset(self, request):
+    queryset = user_admin_get_queryset(self, request)
+    registered_users = RegisteredUser.objects.only(
+        "user_id", "organization_id", "is_verified"
+    )
+    if not request.user.is_superuser:
+        registered_users = registered_users.filter(
+            organization__in=request.user.organizations_managed
+        )
+    return queryset.prefetch_related(
+        Prefetch(
+            "registered_users",
+            queryset=registered_users,
+            to_attr="prefetched_registered_users",
+        )
+    )
 
 
 def get_is_verified(self, obj):
-    try:
-        value = "yes" if obj.registered_user.is_verified else "no"
-    except Exception:
+    prefetched_registered_users = getattr(obj, "prefetched_registered_users", None)
+    if prefetched_registered_users is not None:
+        is_verifieds = [
+            reg_user.is_verified for reg_user in prefetched_registered_users
+        ]
+    else:
+        is_verifieds = []
+    if not is_verifieds:
         value = "unknown"
+    elif any(is_verifieds):
+        value = "yes"
+    else:
+        value = "no"
     icon_url = static(f"admin/img/icon-{value}.svg")
     return mark_safe(f'<img src="{icon_url}" alt="{value}">')
 
 
+UserAdmin.get_queryset = get_queryset
 UserAdmin.get_is_verified = get_is_verified
 UserAdmin.get_is_verified.short_description = _("Verified")
 UserAdmin.list_display.insert(3, "get_is_verified")
-UserAdmin.list_select_related = ("registered_user",)
 
 
 class OrganizationRadiusSettingsInline(admin.StackedInline):
@@ -619,25 +761,6 @@ class OrganizationRadiusSettingsInline(admin.StackedInline):
 OrganizationAdmin.save_on_top = True
 OrganizationAdmin.inlines.append(OrganizationRadiusSettingsInline)
 
-# avoid cluttering the admin with too many models, leave only the
-# minimum required to configure social login and check if it's working
-if app_settings.SOCIAL_REGISTRATION_CONFIGURED:
-    from allauth.socialaccount.admin import SocialAccount, SocialApp, SocialAppAdmin
-
-    class SocialAccountInline(admin.StackedInline):
-        model = SocialAccount
-        extra = 0
-        readonly_fields = ("provider", "uid", "extra_data")
-
-        def has_add_permission(self, request, obj):
-            return False
-
-        def has_delete_permission(self, request, obj=None):
-            return False
-
-    UserAdmin.inlines += [SocialAccountInline]
-    admin.site.register(SocialApp, SocialAppAdmin)
-
 
 if app_settings.USER_ADMIN_RADIUSTOKEN_INLINE:
 
@@ -647,6 +770,8 @@ if app_settings.USER_ADMIN_RADIUSTOKEN_INLINE:
 
         def get_exclude(self, request, obj=None):
             fields = super().get_exclude(request, obj) or []
+            if "password_based" not in fields:
+                fields.append("password_based")
             if not hasattr(obj, "radius_token"):
                 return fields + ["key"]
             return fields

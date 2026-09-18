@@ -57,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 RadiusToken = load_model("RadiusToken")
 RadiusAccounting = load_model("RadiusAccounting")
+RegisteredUser = load_model("RegisteredUser")
 OrganizationRadiusSettings = load_model("OrganizationRadiusSettings")
 OrganizationUser = swapper.load_model("openwisp_users", "OrganizationUser")
 Organization = swapper.load_model("openwisp_users", "Organization")
@@ -290,7 +291,7 @@ class AuthorizeView(GenericAPIView, IDVerificationHelper):
         """
         conditions = self._get_user_query_conditions(request)
         try:
-            user = auth_backend.get_users(username).filter(conditions)[0]
+            user = auth_backend.get_users(username).filter(conditions).distinct()[0]
         except IndexError:
             return None
         # ensure user is member of the authenticated org
@@ -409,36 +410,38 @@ class AuthorizeView(GenericAPIView, IDVerificationHelper):
         # just ensure user is active
         if not needs_verification:
             return is_active
-        # if identity verification is enabled
-        is_verified = Q(registered_user__is_verified=True)
+        organization_id = request._auth
+        registered_user = Q(registered_users__organization_id=organization_id)
+        is_verified = Q(registered_users__is_verified=True)
         AUTHORIZE_UNVERIFIED = registration.AUTHORIZE_UNVERIFIED
-        # and no method should authorize unverified users
-        # ensure user is active AND verified
         if not AUTHORIZE_UNVERIFIED:
-            return is_active & is_verified
+            return is_active & registered_user & is_verified
         # in case some methods are allowed to authorize unverified users
         # ensure user is active AND
         # (user is verified OR user uses one of these methods)
         else:
-            authorize_unverified = Q(registered_user__method__in=AUTHORIZE_UNVERIFIED)
-            return is_active & (is_verified | authorize_unverified)
+            return (
+                is_active
+                & registered_user
+                & (is_verified | Q(registered_users__method__in=AUTHORIZE_UNVERIFIED))
+            )
 
     def authenticate_user(self, request, user, password):
         """
-        returns ``True`` if the password value supplied is
-        a valid user password or a valid user token
-        can be overridden to implement more complex checks
+        Returns ``True`` if the password value supplied is a valid user
+        password or a valid radius user token.
+        Can be overridden to implement more complex checks.
+
+        The local password and the radius token are two distinct
+        credentials with independent expiration rules: a password login is
+        always subject to the user's password expiration policy, while a
+        radius token is judged by how that specific token was issued.
         """
-        return bool(
-            getattr(request, "_mac_allowed", False)
-            or (
-                not user.has_password_expired()
-                and (
-                    user.check_password(password)
-                    or self.check_user_token(request, user, password)
-                )
-            )
-        )
+        if getattr(request, "_mac_allowed", False):
+            return True
+        if user.check_password(password):
+            return not user.has_password_expired()
+        return self.check_user_token(request, user, password)
 
     def check_user_token(self, request, user, password):
         """
@@ -453,6 +456,8 @@ class AuthorizeView(GenericAPIView, IDVerificationHelper):
                 organization_id=self.request.auth,
             )
         except RadiusToken.DoesNotExist:
+            return False
+        if token.password_based is not False and user.has_password_expired():
             return False
         if app_settings.DISPOSABLE_RADIUS_USER_TOKEN:
             token.can_auth = False
@@ -517,6 +522,7 @@ class AccountingView(ListCreateAPIView):
                 self._handle_accounting_on(data)
             return Response(status=status.HTTP_200_OK)
         # Create or Update
+        organization = Organization.objects.get(pk=request.auth)
         try:
             instance = self.get_queryset().get(unique_id=data.get("unique_id"))
         except RadiusAccounting.DoesNotExist:
@@ -527,21 +533,18 @@ class AccountingView(ListCreateAPIView):
                 if self._is_interim_update_corner_case(error, data):
                     return Response(status=status.HTTP_200_OK)
                 raise error
-            acct_data = self._data_to_acct_model(serializer.validated_data.copy())
             try:
-                serializer.create(acct_data)
+                serializer.save(organization=organization)
             # on large systems using mac auth roaming this could happen
             except IntegrityError:
-                logger.info(f"Ignoring duplicate session {acct_data}")
+                logger.info(f"Ignoring duplicate session {serializer.validated_data}")
                 return Response(status=status.HTTP_200_OK)
-            headers = self.get_success_headers(serializer.data)
             self.send_radius_accounting_signal(serializer.validated_data)
-            return Response(status=status.HTTP_201_CREATED, headers=headers)
+            return Response(status=status.HTTP_201_CREATED)
         else:
             serializer = self.get_serializer(instance, data=data, partial=False)
             serializer.is_valid(raise_exception=True)
-            acct_data = self._data_to_acct_model(serializer.validated_data.copy())
-            serializer.update(instance, acct_data)
+            serializer.save(organization=organization)
             self.send_radius_accounting_signal(serializer.validated_data)
             return Response(status=status.HTTP_200_OK)
 
@@ -585,12 +588,6 @@ class AccountingView(ListCreateAPIView):
                 if rad.organization_id != self.request.auth:
                     return True
         return False
-
-    def _data_to_acct_model(self, valid_data):
-        acct_org = Organization.objects.get(pk=self.request.auth)
-        valid_data.pop("status_type", None)
-        valid_data["organization"] = acct_org
-        return valid_data
 
     def send_radius_accounting_signal(self, accounting_data):
         radius_accounting_success.send(

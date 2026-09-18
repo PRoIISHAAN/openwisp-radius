@@ -7,7 +7,6 @@ from urllib.parse import urljoin
 import django.core.validators
 import django.db.models.deletion
 import django.utils.timezone
-import jsonfield.fields
 import model_utils.fields
 import private_storage.fields
 import private_storage.storage.files
@@ -543,7 +542,7 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "sms_meta_data",
-                    jsonfield.fields.JSONField(
+                    models.TextField(
                         blank=True,
                         help_text=(
                             "Additional configuration for SMS backend in JSON format"
@@ -695,9 +694,7 @@ class Migration(migrations.Migration):
                 ),
                 (
                     "user_credentials",
-                    jsonfield.fields.JSONField(
-                        blank=True, null=True, verbose_name="PDF"
-                    ),
+                    models.TextField(blank=True, null=True, verbose_name="PDF"),
                 ),
                 (
                     "expiration_date",
@@ -706,6 +703,22 @@ class Migration(migrations.Migration):
                         help_text="If left blank users will never expire",
                         null=True,
                         verbose_name="expiration date",
+                    ),
+                ),
+                (
+                    "group",
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        to=swapper.get_model_name("openwisp_radius", "RadiusGroup"),
+                        verbose_name="radius group",
+                    ),
+                ),
+                (
+                    "notes",
+                    models.TextField(
+                        blank=True, help_text="internal notes", verbose_name="notes"
                     ),
                 ),
                 ("details", models.CharField(blank=True, max_length=64, null=True)),

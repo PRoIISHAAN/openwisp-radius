@@ -1,18 +1,24 @@
 import os
+from datetime import timedelta
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import swapper
+from allauth.account.models import EmailAddress
 from django.conf import settings
 from django.contrib.auth import SESSION_KEY, get_user_model
 from django.core import mail
-from django.test import TestCase, override_settings
+from django.db import IntegrityError
+from django.test import TestCase, modify_settings, override_settings
 from django.urls import reverse, reverse_lazy
+from django.utils.timezone import now
 from djangosaml2.tests import auth_response, conf
 from djangosaml2.utils import get_session_id_from_saml2, saml2_from_httpredirect_request
 from rest_framework.authtoken.models import Token
 
+from openwisp_radius import settings as app_settings
 from openwisp_radius.saml.utils import get_url_or_path
+from openwisp_users.auth import SESSION_KEY as OPENWISP_SESSION_KEY
 from openwisp_users.tests.utils import TestOrganizationMixin
 from openwisp_utils.tests import capture_any_output
 
@@ -71,6 +77,7 @@ class TestAssertionConsumerServiceView(TestSamlMixin, TestCase):
         self.assertEqual(User.objects.count(), 1)
         user_id = self.client.session[SESSION_KEY]
         user = User.objects.get(id=user_id)
+        self.assertEqual(user.password_based_token, False)
         self.assertEqual(
             user.emailaddress_set.filter(verified=True, primary=True).count(), 1
         )
@@ -108,6 +115,28 @@ class TestAssertionConsumerServiceView(TestSamlMixin, TestCase):
         query_params = parse_qs(urlparse(response.url).query)
         self._post_successful_auth_assertions(query_params, org_slug)
 
+    def test_saml_login_issues_external_radius_token(self):
+        org_slug = "default"
+        relay_state = self._get_relay_state(
+            redirect_url="/radius/saml2/additional-info/", org_slug=org_slug
+        )
+        saml_response, relay_state = self._get_saml_response_for_acs_view(relay_state)
+        response = self.client.post(
+            reverse("radius:saml2_acs"),
+            {
+                "SAMLResponse": self.b64_for_post(saml_response),
+                "RelayState": relay_state,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        user = User.objects.get(username="org_user@example.com")
+        token = Token.objects.get(user=user)
+        response = self.client.post(
+            reverse("radius:validate_auth_token", args=[org_slug]), {"token": token.key}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RadiusToken.objects.get(user=user).password_based, False)
+
     @capture_any_output()
     def test_invalid_email_raise_validation_error(self):
         invalid_email = "invalid_email@example"
@@ -126,9 +155,137 @@ class TestAssertionConsumerServiceView(TestSamlMixin, TestCase):
                 },
             )
         mocked_logger.assert_called_once_with(
-            'Failed email validation for "invalid_email@example" during'
+            'Failed email synchronization for "invalid_email@example" during'
             " SAML user creation"
         )
+
+    @capture_any_output()
+    def test_saml_login_email_case_insensitive(self):
+        redirect_url = "https://captive-portal.example.com"
+
+        def login(uid):
+            relay_state = self._get_relay_state(
+                redirect_url=redirect_url, org_slug="default"
+            )
+            saml_response, relay_state = self._get_saml_response_for_acs_view(
+                relay_state, uid=uid
+            )
+            return self.client.post(
+                reverse("radius:saml2_acs"),
+                {
+                    "SAMLResponse": self.b64_for_post(saml_response),
+                    "RelayState": relay_state,
+                },
+            )
+
+        def assert_redirect(response, user):
+            user.refresh_from_db()
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(
+                get_url_or_path(response.url), "/radius/saml2/additional-info/"
+            )
+            self.assertDictEqual(
+                parse_qs(urlparse(response.url).query),
+                {
+                    "next": [
+                        f"{redirect_url}"
+                        f"?username={quote(user.username)}"
+                        f"&token={Token.objects.get(user=user).key}"
+                        "&login_method=saml"
+                    ]
+                },
+            )
+
+        with self.subTest("new email address"):
+            with patch("openwisp_radius.saml.views.logger.exception") as mocked_logger:
+                response = login("Org_User@example.com")
+            user = User.objects.get(email="Org_User@example.com")
+            assert_redirect(response, user)
+            mocked_logger.assert_not_called()
+            email_address = EmailAddress.objects.get(user=user)
+            self.assertEqual(email_address.email, "org_user@example.com")
+            with patch("openwisp_radius.saml.views.logger.exception") as mocked_logger:
+                response = login("Org_User@example.com")
+            assert_redirect(response, user)
+            mocked_logger.assert_not_called()
+            self.assertEqual(EmailAddress.objects.filter(user=user).count(), 1)
+
+        with self.subTest("existing email address"):
+            user = self._create_user(
+                username="test-user", email="Existing_User@example.com"
+            )
+            user.refresh_from_db()
+            EmailAddress.objects.filter(user=user).update(email=user.email.upper())
+            with patch("openwisp_radius.saml.views.logger.exception") as mocked_logger:
+                response = login(user.email)
+            assert_redirect(response, user)
+            mocked_logger.assert_not_called()
+            email_address = EmailAddress.objects.get(user=user)
+            self.assertEqual(email_address.email, user.email)
+
+        with self.subTest("multiple email addresses with lowercase address"):
+            user = self._create_user(
+                username="multiple-emails", email="multiple@example.com"
+            )
+            user.refresh_from_db()
+            EmailAddress.objects.filter(user=user).update(email=user.email.upper())
+            EmailAddress.objects.create(user=user, email=user.email, verified=True)
+            with patch("openwisp_radius.saml.views.logger.exception") as mocked_logger:
+                response = login(user.email)
+            assert_redirect(response, user)
+            mocked_logger.assert_called_once_with(
+                f'Failed email synchronization for "{user}" during'
+                " SAML user creation"
+            )
+            self.assertEqual(EmailAddress.objects.filter(user=user).count(), 2)
+
+        with self.subTest("multiple email addresses without lowercase address"):
+            user = self._create_user(
+                username="multiple-uppercase-emails", email="multiple2@example.com"
+            )
+            user.refresh_from_db()
+            EmailAddress.objects.filter(user=user).update(email=user.email.upper())
+            EmailAddress.objects.create(
+                user=user, email=user.email.title(), verified=True
+            )
+            with patch("openwisp_radius.saml.views.logger.exception") as mocked_logger:
+                response = login(user.email)
+            assert_redirect(response, user)
+            mocked_logger.assert_called_once_with(
+                f'Failed email synchronization for "{user}" during'
+                " SAML user creation"
+            )
+            self.assertSetEqual(
+                set(
+                    EmailAddress.objects.filter(user=user).values_list(
+                        "email", flat=True
+                    )
+                ),
+                {user.email.upper(), user.email.title()},
+            )
+
+        with self.subTest("concurrent email address creation"):
+            with patch.object(EmailAddress, "save", side_effect=IntegrityError):
+                with patch(
+                    "openwisp_radius.saml.views.logger.exception"
+                ) as mocked_logger:
+                    response = login("concurrent@example.com")
+            user = User.objects.get(email="concurrent@example.com")
+            assert_redirect(response, user)
+            mocked_logger.assert_called_once_with(
+                'Failed email synchronization for "concurrent@example.com" '
+                "during SAML user creation"
+            )
+            self.assertTrue(
+                OrganizationUser.objects.filter(
+                    organization__slug="default", user=user
+                ).exists()
+            )
+            self.assertTrue(
+                RegisteredUser.objects.filter(
+                    organization__slug="default", user=user, method="saml"
+                ).exists()
+            )
 
     @capture_any_output()
     def test_relay_state_relative_path(self):
@@ -151,9 +308,38 @@ class TestAssertionConsumerServiceView(TestSamlMixin, TestCase):
         self._post_successful_auth_assertions(query_params, org_slug)
 
     @capture_any_output()
-    def test_user_registered_with_non_saml_method(self):
+    def test_pending_verification_registered_user_updated_for_org(self):
+        org = Organization.objects.get(slug="default")
         user = self._create_user(username="test-user", email="org_user@example.com")
-        RegisteredUser.objects.create(user=user, method="manual")
+        registered_user = RegisteredUser.objects.create(
+            user=user,
+            organization=org,
+            method="pending_verification",
+            is_verified=False,
+        )
+        relay_state = self._get_relay_state(
+            redirect_url="https://captive-portal.example.com", org_slug="default"
+        )
+        saml_response, relay_state = self._get_saml_response_for_acs_view(relay_state)
+        response = self.client.post(
+            reverse("radius:saml2_acs"),
+            {
+                "SAMLResponse": self.b64_for_post(saml_response),
+                "RelayState": relay_state,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        registered_users = RegisteredUser.objects.filter(user=user, organization=org)
+        self.assertEqual(registered_users.count(), 1)
+        registered_user.refresh_from_db()
+        self.assertEqual(registered_user.method, "saml")
+        self.assertEqual(registered_user.is_verified, app_settings.SAML_IS_VERIFIED)
+
+    @capture_any_output()
+    def test_user_registered_with_non_saml_method(self):
+        org = Organization.objects.get(slug="default")
+        user = self._create_user(username="test-user", email="org_user@example.com")
+        RegisteredUser.objects.create(user=user, method="manual", organization=org)
         relay_state = self._get_relay_state(
             redirect_url="https://captive-portal.example.com", org_slug="default"
         )
@@ -193,6 +379,178 @@ class TestAssertionConsumerServiceView(TestSamlMixin, TestCase):
                 self.assertEqual(response.status_code, 302)
                 user.refresh_from_db()
                 self.assertEqual(user.username, "org_user@example.com")
+
+    @capture_any_output()
+    def test_saml_login_marks_existing_email_verified(self):
+        org = Organization.objects.get(slug="default")
+        user = self._create_user(username="test-user", email="org_user@example.com")
+        user.emailaddress_set.all().delete()
+        email_address = EmailAddress.objects.create(
+            user=user,
+            email="org_user@example.com",
+            primary=True,
+            verified=False,
+        )
+        registered_user = RegisteredUser.objects.create(
+            user=user,
+            organization=org,
+            method="pending_verification",
+            is_verified=False,
+        )
+        relay_state = self._get_relay_state(
+            redirect_url="https://captive-portal.example.com", org_slug="default"
+        )
+        saml_response, relay_state = self._get_saml_response_for_acs_view(relay_state)
+        response = self.client.post(
+            reverse("radius:saml2_acs"),
+            {
+                "SAMLResponse": self.b64_for_post(saml_response),
+                "RelayState": relay_state,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        email_address.refresh_from_db()
+        registered_user.refresh_from_db()
+        self.assertTrue(email_address.verified)
+        self.assertTrue(email_address.primary)
+        self.assertEqual(EmailAddress.objects.filter(user=user).count(), 1)
+        self.assertEqual(registered_user.method, "saml")
+        self.assertEqual(registered_user.is_verified, app_settings.SAML_IS_VERIFIED)
+        self.assertEqual(
+            RegisteredUser.objects.filter(user=user, organization=org).count(), 1
+        )
+
+    @capture_any_output()
+    def test_saml_login_existing_email_already_verified(self):
+        org = Organization.objects.get(slug="default")
+        user = self._create_user(username="test-user", email="org_user@example.com")
+        user.emailaddress_set.all().delete()
+        email_address = EmailAddress.objects.create(
+            user=user,
+            email="org_user@example.com",
+            primary=True,
+            verified=True,
+        )
+        registered_user = RegisteredUser.objects.create(
+            user=user,
+            organization=org,
+            method="pending_verification",
+            is_verified=False,
+        )
+        relay_state = self._get_relay_state(
+            redirect_url="https://captive-portal.example.com", org_slug="default"
+        )
+        saml_response, relay_state = self._get_saml_response_for_acs_view(relay_state)
+        response = self.client.post(
+            reverse("radius:saml2_acs"),
+            {
+                "SAMLResponse": self.b64_for_post(saml_response),
+                "RelayState": relay_state,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        email_address.refresh_from_db()
+        registered_user.refresh_from_db()
+        self.assertEqual(email_address.verified, True)
+        self.assertEqual(email_address.primary, True)
+        self.assertEqual(EmailAddress.objects.filter(user=user).count(), 1)
+        self.assertEqual(registered_user.method, "saml")
+        self.assertEqual(registered_user.is_verified, app_settings.SAML_IS_VERIFIED)
+        self.assertEqual(
+            RegisteredUser.objects.filter(user=user, organization=org).count(), 1
+        )
+
+    @override_settings(SAML_DJANGO_USER_MAIN_ATTRIBUTE="username")
+    @capture_any_output()
+    def test_saml_login_preserves_existing_primary_email_different_uid(self):
+        org = Organization.objects.get(slug="default")
+        user = self._create_user(
+            username="saml-user@example.com",
+            email="existing-primary@example.com",
+        )
+        user.emailaddress_set.all().delete()
+        existing_primary = EmailAddress.objects.create(
+            user=user,
+            email="existing-primary@example.com",
+            primary=True,
+            verified=True,
+        )
+        registered_user = RegisteredUser.objects.create(
+            user=user,
+            organization=org,
+            method="pending_verification",
+            is_verified=False,
+        )
+        relay_state = self._get_relay_state(
+            redirect_url="https://captive-portal.example.com", org_slug="default"
+        )
+        saml_response, relay_state = self._get_saml_response_for_acs_view(
+            relay_state, uid="saml-user@example.com"
+        )
+        response = self.client.post(
+            reverse("radius:saml2_acs"),
+            {
+                "SAMLResponse": self.b64_for_post(saml_response),
+                "RelayState": relay_state,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        existing_primary.refresh_from_db()
+        self.assertEqual(existing_primary.primary, True)
+        self.assertEqual(existing_primary.verified, True)
+        new_email = EmailAddress.objects.get(user=user, email="saml-user@example.com")
+        self.assertEqual(new_email.primary, False)
+        self.assertEqual(new_email.verified, True)
+        self.assertEqual(EmailAddress.objects.filter(user=user).count(), 2)
+        registered_user.refresh_from_db()
+        self.assertEqual(registered_user.method, "saml")
+        self.assertEqual(registered_user.is_verified, app_settings.SAML_IS_VERIFIED)
+        self.assertEqual(
+            RegisteredUser.objects.filter(user=user, organization=org).count(), 1
+        )
+
+    @modify_settings(
+        MIDDLEWARE={"append": "openwisp_users.middleware.PasswordExpirationMiddleware"}
+    )
+    @patch("openwisp_users.settings.USER_PASSWORD_EXPIRATION", 30)
+    @capture_any_output()
+    def test_saml_login_marks_session_as_not_password_based(self):
+        # The SAML user has a usable but expired local password: without the
+        # session being marked as not password-based, PasswordExpirationMiddleware
+        # would redirect every request from this session to the password-change page.
+        org_slug = "default"
+        user = self._create_user(
+            username="org_user@example.com", email="org_user@example.com"
+        )
+        User.objects.filter(pk=user.pk).update(
+            password_updated=(now() - timedelta(days=60)).date()
+        )
+        user.refresh_from_db()
+        self.assertEqual(user.has_password_expired(), True)
+
+        relay_state = self._get_relay_state(
+            redirect_url="/radius/saml2/additional-info/", org_slug=org_slug
+        )
+        saml_response, relay_state = self._get_saml_response_for_acs_view(relay_state)
+        response = self.client.post(
+            reverse("radius:saml2_acs"),
+            {
+                "SAMLResponse": self.b64_for_post(saml_response),
+                "RelayState": relay_state,
+            },
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertNotEqual(
+            get_url_or_path(response.url), reverse("account_change_password")
+        )
+        self.assertEqual(self.client.session[OPENWISP_SESSION_KEY], False)
+        # subsequent requests from the same session must not be blocked either
+        additional_info_response = self.client.get(response.url)
+        self.assertEqual(additional_info_response.status_code, 302)
+        self.assertNotEqual(
+            get_url_or_path(additional_info_response.url),
+            reverse("account_change_password"),
+        )
 
 
 @override_settings(SAML_ALLOWED_HOSTS=["captive-portal.example.com"])
@@ -294,12 +652,15 @@ class TestLoginView(TestSamlMixin, TestCase):
         org.radius_settings.save()
         redirect_url = "https://captive-portal.example.com"
         with self.subTest("SAML authentication is disabled site-wide"):
-            with patch(
-                "openwisp_radius.settings.SAML_REGISTRATION_ENABLED", False
-            ), patch.object(
-                OrganizationRadiusSettings._meta.get_field("saml_registration_enabled"),
-                "fallback",
-                False,
+            with (
+                patch("openwisp_radius.settings.SAML_REGISTRATION_ENABLED", False),
+                patch.object(
+                    OrganizationRadiusSettings._meta.get_field(
+                        "saml_registration_enabled"
+                    ),
+                    "fallback",
+                    False,
+                ),
             ):
                 response = self.client.get(
                     self.login_url,
