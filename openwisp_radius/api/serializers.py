@@ -332,21 +332,27 @@ class UserGroupCheckSerializer(serializers.ModelSerializer):
         model = RadiusGroupCheck
         fields = ("attribute", "op", "value", "result", "type", "reset")
 
+    def get_consumption_and_reset(self, obj):
+        if not hasattr(self, "_usage"):
+            self._usage = {}
+        if obj.pk not in self._usage:
+            try:
+                Counter = app_settings.CHECK_ATTRIBUTE_COUNTERS_MAP[obj.attribute]
+                counter = Counter(
+                    user=self.context["user"],
+                    group=self.context["group"],
+                    group_check=obj,
+                )
+                consumed, reset = counter.get_consumption_and_reset()
+                value = int(obj.value)
+                self._usage[obj.pk] = (min(consumed, value), reset)
+            except (SkipCheck, ValueError, KeyError):
+                self._usage[obj.pk] = (None, None)
+        return self._usage[obj.pk]
+
     def get_result(self, obj):
-        try:
-            Counter = app_settings.CHECK_ATTRIBUTE_COUNTERS_MAP[obj.attribute]
-            counter = Counter(
-                user=self.context["user"],
-                group=self.context["group"],
-                group_check=obj,
-            )
-            consumed = counter.consumed()
-            value = int(obj.value)
-            if consumed > value:
-                consumed = value
-            return consumed
-        except (SkipCheck, ValueError, KeyError):
-            return None
+        consumed, _ = self.get_consumption_and_reset(obj)
+        return consumed
 
     def get_type(self, obj):
         try:
@@ -357,17 +363,8 @@ class UserGroupCheckSerializer(serializers.ModelSerializer):
             return counter.get_attribute_type()
 
     def get_reset(self, obj):
-        try:
-            Counter = app_settings.CHECK_ATTRIBUTE_COUNTERS_MAP[obj.attribute]
-            counter = Counter(
-                user=self.context["user"],
-                group=self.context["group"],
-                group_check=obj,
-            )
-            _, end_time = counter.get_reset_timestamps()
-            return end_time
-        except (SkipCheck, ValueError, KeyError):
-            return None
+        _, reset = self.get_consumption_and_reset(obj)
+        return reset
 
 
 class UserRadiusUsageSerializer(serializers.Serializer):

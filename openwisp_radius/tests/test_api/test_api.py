@@ -22,6 +22,7 @@ from django.core.mail import EmailMultiAlternatives
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import formats, timezone
+from freezegun import freeze_time
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
@@ -1465,6 +1466,53 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             },
         )
 
+    def test_user_group_check_serializer_reuses_counter_period(self):
+        reset_time = 1_520_035_200
+
+        class Counter:
+            calls = 0
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            @classmethod
+            def get_attribute_type(cls):
+                return "seconds"
+
+            def get_consumption_and_reset(self):
+                self.__class__.calls += 1
+                return 3600, reset_time
+
+        group = self._create_radius_group(name="custom counter group")
+        group_check = self._create_radius_groupcheck(
+            attribute="Custom-Session-Counter",
+            op=":=",
+            value="7200",
+            group=group,
+            groupname=group.name,
+        )
+        with mock.patch.object(
+            app_settings,
+            "CHECK_ATTRIBUTE_COUNTERS_MAP",
+            {group_check.attribute: Counter},
+        ):
+            serializer = UserGroupCheckSerializer(
+                group_check,
+                context={"user": self._get_user(), "group": group},
+            )
+            self.assertDictEqual(
+                serializer.data,
+                {
+                    "attribute": "Custom-Session-Counter",
+                    "op": ":=",
+                    "value": "7200",
+                    "result": 3600,
+                    "type": "seconds",
+                    "reset": reset_time,
+                },
+            )
+        self.assertEqual(Counter.calls, 1)
+
     def _add_model_permission(self, user, model, actions):
         """action must be one of: 'view', 'add', 'change', 'delete'"""
         content_type = ContentType.objects.get_for_model(model)
@@ -2142,6 +2190,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
 
 
 class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
+    @freeze_time("2018-03-02T11:43:24+01:00")
     def test_user_radius_usage_view(self):
         auth_url = reverse("radius:user_auth_token", args=[self.default_org.slug])
         usage_url = reverse("radius:user_radius_usage", args=[self.default_org.slug])
@@ -2165,7 +2214,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "10800",
                     "result": 0,
                     "type": "seconds",
-                    "reset": checks[0]["reset"],
+                    "reset": 1520035200,
                 },
             )
             self.assertDictEqual(
@@ -2176,7 +2225,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "3000000000",
                     "result": 0,
                     "type": "bytes",
-                    "reset": checks[1]["reset"],
+                    "reset": 1520035200,
                 },
             )
 
@@ -2208,7 +2257,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "10800",
                     "result": 261,
                     "type": "seconds",
-                    "reset": checks[0]["reset"],
+                    "reset": 1520035200,
                 },
             )
             self.assertDictEqual(
@@ -2219,7 +2268,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "3000000000",
                     "result": 2000000000,
                     "type": "bytes",
-                    "reset": checks[1]["reset"],
+                    "reset": 1520035200,
                 },
             )
 
@@ -2248,7 +2297,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "10800",
                     "result": 522,
                     "type": "seconds",
-                    "reset": checks[0]["reset"],
+                    "reset": 1520035200,
                 },
             )
             self.assertDictEqual(
@@ -2259,7 +2308,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "3000000000",
                     "result": 3000000000,
                     "type": "bytes",
-                    "reset": checks[1]["reset"],
+                    "reset": 1520035200,
                 },
             )
 
@@ -2288,7 +2337,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "10800",
                     "result": 783,
                     "type": "seconds",
-                    "reset": checks[0]["reset"],
+                    "reset": 1520035200,
                 },
             )
             self.assertDictEqual(
@@ -2299,7 +2348,7 @@ class TestTransactionApi(AcctMixin, ApiTokenMixin, BaseTransactionTestCase):
                     "value": "3000000000",
                     "result": 3000000000,
                     "type": "bytes",
-                    "reset": checks[1]["reset"],
+                    "reset": 1520035200,
                 },
             )
 
