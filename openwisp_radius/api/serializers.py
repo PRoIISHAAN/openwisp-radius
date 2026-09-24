@@ -343,7 +343,13 @@ class UserGroupCheckSerializer(serializers.ModelSerializer):
                     group=self.context["group"],
                     group_check=obj,
                 )
-                consumed, reset = counter.get_consumption_and_reset()
+                # BACKWARD COMPATIBILITY: custom counters may only implement
+                # consumed(). TODO: Remove this fallback in 1.5.0.
+                method = getattr(counter, "get_consumption_and_reset", None)
+                if method is None:
+                    consumed, reset = counter.consumed(), None
+                else:
+                    consumed, reset = method()
                 value = int(obj.value)
                 self._usage[obj.pk] = (min(consumed, value), reset)
             except (SkipCheck, ValueError, KeyError):

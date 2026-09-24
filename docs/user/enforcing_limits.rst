@@ -169,7 +169,7 @@ Once the new class is ready, you will need to add it to
 
 Custom counters which inherit from ``BaseCounter`` automatically expose
 their consumption and reset time in the user usage API. A custom counter
-which does not inherit from ``BaseCounter`` must implement
+which does not inherit from ``BaseCounter`` can implement
 ``get_consumption_and_reset`` and return a tuple containing the consumed
 quota and the Unix reset timestamp in seconds, or ``None`` when it does
 not reset.

@@ -40,6 +40,7 @@ from openwisp_radius.api.serializers import (
 )
 from openwisp_radius.api.views import PasswordResetConfirmView, PasswordResetView
 from openwisp_radius.base.forms import PasswordResetForm
+from openwisp_radius.counters.base import BaseCounter
 from openwisp_users.api.serializers import (
     PasswordResetSerializer as UsersPasswordResetSerializer,
 )
@@ -1512,6 +1513,90 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
                 },
             )
         self.assertEqual(Counter.calls, 1)
+
+    def test_user_group_check_serializer_uses_legacy_counter_consumption(self):
+        class Counter:
+            @classmethod
+            def get_attribute_type(cls):
+                return "seconds"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def consumed(self):
+                return 3600
+
+        group = self._create_radius_group(name="legacy custom counter group")
+        group_check = self._create_radius_groupcheck(
+            attribute="Legacy-Custom-Session-Counter",
+            op=":=",
+            value="7200",
+            group=group,
+            groupname=group.name,
+        )
+        with mock.patch.object(
+            app_settings,
+            "CHECK_ATTRIBUTE_COUNTERS_MAP",
+            {group_check.attribute: Counter},
+        ):
+            serializer = UserGroupCheckSerializer(
+                group_check,
+                context={"user": self._get_user(), "group": group},
+            )
+            self.assertDictEqual(
+                serializer.data,
+                {
+                    "attribute": "Legacy-Custom-Session-Counter",
+                    "op": ":=",
+                    "value": "7200",
+                    "result": 3600,
+                    "type": "seconds",
+                    "reset": None,
+                },
+            )
+
+    def test_user_group_check_serializer_uses_overridden_consumption(self):
+        class Counter(BaseCounter):
+            counter_name = "CustomSessionCounter"
+            check_name = "Custom-Session-Counter"
+            reply_names = ("Session-Timeout",)
+            reset = "never"
+            sql = "SELECT 0"
+
+            def get_sql_params(self, start_time, end_time):
+                return []
+
+            def consumed(self):
+                return 3600
+
+        group = self._create_radius_group(name="custom counter group")
+        group_check = self._create_radius_groupcheck(
+            attribute=Counter.check_name,
+            op=":=",
+            value="7200",
+            group=group,
+            groupname=group.name,
+        )
+        with mock.patch.object(
+            app_settings,
+            "CHECK_ATTRIBUTE_COUNTERS_MAP",
+            {group_check.attribute: Counter},
+        ):
+            serializer = UserGroupCheckSerializer(
+                group_check,
+                context={"user": self._get_user(), "group": group},
+            )
+            self.assertDictEqual(
+                serializer.data,
+                {
+                    "attribute": "Custom-Session-Counter",
+                    "op": ":=",
+                    "value": "7200",
+                    "result": 3600,
+                    "type": "seconds",
+                    "reset": None,
+                },
+            )
 
     def _add_model_permission(self, user, model, actions):
         """action must be one of: 'view', 'add', 'change', 'delete'"""
