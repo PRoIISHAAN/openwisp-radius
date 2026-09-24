@@ -151,8 +151,8 @@ class BaseCounter(ABC):
         return int(self.get_counter())
 
     def get_consumption_and_reset(self):
-        start_time, end_time = self.get_reset_timestamps()
-        return int(self._get_counter(start_time, end_time)), end_time
+        _, end_time = self.get_reset_timestamps()
+        return self.consumed(), end_time
 
 
 class BaseDailyCounter(BaseCounter):
